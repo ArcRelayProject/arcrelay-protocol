@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "productId": "com.arcrelay.suite",
+  "productCode": "suite",
+  "displayName": "ArcRelay",
+  "dataNamespace": "arcrelay-suite",
+  "includedModules": [
+    "mouse",
+    "transfer",
+    "clipboard",
+    "monitor",
+    "privacy",
+    "automate",
+    "print"
+  ],
+  "enabledUiRoutes": [
+    "mouse",
+    "transfer",
+    "clipboard",
+    "monitor",
+    "privacy",
+    "automate",
+    "print"
+  ],
+  "defaultActivationPolicy": {
+    "mouse": "on_interest",
+    "transfer": "on_interest",
+    "clipboard": "on_interest",
+    "monitor": "on_interest",
+    "privacy": "on_interest",
+    "automate": "scheduled",
+    "print": "on_interest"
+  }
+}

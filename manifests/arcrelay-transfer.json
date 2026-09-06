@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "productId": "com.arcrelay.transfer",
+  "productCode": "xfer",
+  "displayName": "ArcRelay Transfer",
+  "dataNamespace": "arcrelay-transfer",
+  "includedModules": ["transfer"],
+  "enabledUiRoutes": ["transfer"],
+  "defaultActivationPolicy": {
+    "transfer": "on_interest"
+  }
+}

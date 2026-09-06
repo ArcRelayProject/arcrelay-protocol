@@ -1,0 +1,42 @@
+[package]
+name = "arcrelay-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[features]
+default = ["host"]
+host = ["dep:arcrelay-core"]
+
+[lints.clippy]
+# These shape lints are tracked by the ongoing protocol-handler module split;
+# keep CI strict for correctness, allocation, and API-quality warnings.
+too_many_arguments = "allow"
+result_large_err = "allow"
+
+[dependencies]
+ts-rs = { version = "12", features = ["serde-json-impl", "chrono-impl", "uuid-impl", "no-serde-warnings"] }
+async-trait = "0.1"
+arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "e4a4eda4e9cc8c3d823e94b0e05f2aa4860c5d25", optional = true }
+arcrelay-transport = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-transport.git", rev = "16305821fea3778e3fc544f0e57eb3b5b51fec11" }
+arcrelay-wire = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-wire.git", rev = "ac143db0e09039d7eeaf211f1399141086716533" }
+arcrelay-network = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-network.git", rev = "45778f0595571be3cd6d7bfc1657d71e0ba9d8b1" }
+arcrelay-peer = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-peer.git", rev = "739e41c49020cf19f0d490c64143e68e995aef83" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+thiserror = "2"
+rand = "0.8"
+base64 = "0.22"
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+bytes = "1"
+sha2 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
