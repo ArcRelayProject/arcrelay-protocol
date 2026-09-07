@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 pub const DEFAULT_REMOTE_DIRECTORY_PAGE_SIZE: u32 = 100;
 pub const MAX_REMOTE_DIRECTORY_PAGE_SIZE: u32 = 200;
+pub const MAX_REMOTE_RANGE_BYTES: u32 = 256 * 1024;
 /// Protocol v2 requires every failed response to carry a stable error code.
 pub const REMOTE_FILE_PROTOCOL_VERSION: u32 = 2;
 
@@ -202,6 +203,37 @@ pub struct RemoteFileThumbnail {
 #[serde(tag = "operation", rename_all = "camelCase")]
 pub enum RemoteFileRequest {
     ListShares,
+    Stat {
+        share_id: String,
+        relative_path: String,
+    },
+    Move {
+        share_id: String,
+        relative_path: String,
+        destination_path: String,
+        overwrite: bool,
+        expected_revision: String,
+    },
+    ConditionalDelete {
+        share_id: String,
+        relative_path: String,
+        expected_revision: String,
+        recursive: bool,
+    },
+    ReadRange {
+        share_id: String,
+        relative_path: String,
+        offset: u64,
+        length: u32,
+        revision: String,
+    },
+    ConditionalUpload {
+        share_id: String,
+        relative_path: String,
+        name: String,
+        size: u64,
+        expected_revision: String,
+    },
     ListDirectory {
         share_id: String,
         relative_path: String,
@@ -257,6 +289,11 @@ impl RemoteFileRequest {
     pub const fn operation_name(&self) -> &'static str {
         match self {
             Self::ListShares => "list_shares",
+            Self::Stat { .. } => "stat",
+            Self::Move { .. } => "move",
+            Self::ConditionalDelete { .. } => "conditional_delete",
+            Self::ReadRange { .. } => "read_range",
+            Self::ConditionalUpload { .. } => "conditional_upload",
             Self::ListDirectory { .. } => "list_directory",
             Self::CreateDirectory { .. } => "create_directory",
             Self::Rename { .. } => "rename",
@@ -270,6 +307,81 @@ impl RemoteFileRequest {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::ListShares => Ok(()),
+            Self::Stat {
+                share_id,
+                relative_path,
+            } => {
+                validate_share_id(share_id)?;
+                validate_relative_path(relative_path)
+            }
+            Self::ConditionalDelete {
+                share_id,
+                relative_path,
+                expected_revision,
+                ..
+            } => {
+                validate_share_id(share_id)?;
+                validate_relative_path(relative_path)?;
+                if relative_path.is_empty()
+                    || expected_revision.is_empty()
+                    || expected_revision.len() > 128
+                {
+                    return Err("invalid conditional delete".into());
+                }
+                Ok(())
+            }
+            Self::Move {
+                share_id,
+                relative_path,
+                destination_path,
+                expected_revision,
+                ..
+            } => {
+                validate_share_id(share_id)?;
+                validate_relative_path(relative_path)?;
+                validate_relative_path(destination_path)?;
+                if expected_revision.is_empty() || expected_revision.len() > 128 {
+                    return Err("invalid move revision".into());
+                }
+                if relative_path.is_empty() || destination_path.is_empty() {
+                    return Err("cannot move a shared root".into());
+                }
+                Ok(())
+            }
+            Self::ReadRange {
+                share_id,
+                relative_path,
+                offset,
+                length,
+                revision,
+            } => {
+                validate_share_id(share_id)?;
+                validate_relative_path(relative_path)?;
+                if *length == 0
+                    || *length > MAX_REMOTE_RANGE_BYTES
+                    || offset.checked_add(u64::from(*length)).is_none()
+                    || revision.is_empty()
+                    || revision.len() > 128
+                {
+                    return Err("invalid remote file range".into());
+                }
+                Ok(())
+            }
+            Self::ConditionalUpload {
+                share_id,
+                relative_path,
+                name,
+                size,
+                expected_revision,
+            } => {
+                validate_share_id(share_id)?;
+                validate_relative_path(relative_path)?;
+                validate_file_name(name)?;
+                if *size > MAX_REMOTE_FILE_CONTENT_SIZE || expected_revision.len() > 128 {
+                    return Err("invalid conditional upload".into());
+                }
+                Ok(())
+            }
             Self::ListDirectory {
                 share_id,
                 relative_path,
@@ -359,6 +471,10 @@ pub struct RemoteFileResponse {
     pub thumbnail_size: u64,
     #[serde(default)]
     pub thumbnail_media_type: Option<String>,
+    #[serde(default)]
+    pub revision: String,
+    #[serde(default)]
+    pub range_data: Vec<u8>,
 }
 
 impl RemoteFileResponse {
@@ -372,6 +488,8 @@ impl RemoteFileResponse {
             entry: None,
             thumbnail_size: 0,
             thumbnail_media_type: None,
+            revision: String::new(),
+            range_data: Vec::new(),
         }
     }
 
@@ -393,6 +511,8 @@ impl RemoteFileResponse {
             entry: None,
             thumbnail_size: 0,
             thumbnail_media_type: None,
+            revision: String::new(),
+            range_data: Vec::new(),
         }
     }
 
@@ -402,6 +522,8 @@ impl RemoteFileResponse {
 
     fn validate(&self) -> Result<(), String> {
         if self.ok == self.error.is_some()
+            || self.revision.len() > 128
+            || self.range_data.len() > MAX_REMOTE_RANGE_BYTES as usize
             || self
                 .error
                 .as_ref()
@@ -492,6 +614,72 @@ pub struct RemoteFileUpload {
 
 #[async_trait]
 pub trait RemoteFileProvider: Send + Sync {
+    async fn stat(
+        &self,
+        _share_id: &str,
+        _path: &str,
+    ) -> RemoteFileResult<(RemoteFileEntry, String)> {
+        Err(RemoteFileError::new(
+            RemoteFileErrorCode::FailedPrecondition,
+            "this device does not support system folders; update ArcRelay on both devices",
+        ))
+    }
+
+    async fn move_entry(
+        &self,
+        _share_id: &str,
+        _source: &str,
+        _destination: &str,
+        _overwrite: bool,
+        _expected: &str,
+    ) -> RemoteFileResult<RemoteFileEntry> {
+        Err(RemoteFileError::new(
+            RemoteFileErrorCode::FailedPrecondition,
+            "system folder moves are not supported",
+        ))
+    }
+
+    async fn conditional_delete(
+        &self,
+        _share_id: &str,
+        _path: &str,
+        _expected: &str,
+        _recursive: bool,
+    ) -> RemoteFileResult<()> {
+        Err(RemoteFileError::new(
+            RemoteFileErrorCode::FailedPrecondition,
+            "conditional deletes are not supported",
+        ))
+    }
+
+    async fn read_range(
+        &self,
+        _share_id: &str,
+        _path: &str,
+        _offset: u64,
+        _length: u32,
+        _revision: &str,
+    ) -> RemoteFileResult<Vec<u8>> {
+        Err(RemoteFileError::new(
+            RemoteFileErrorCode::FailedPrecondition,
+            "file range reads are not supported",
+        ))
+    }
+
+    async fn commit_system_upload(
+        &self,
+        _share_id: &str,
+        _path: &str,
+        _name: &str,
+        _temporary: &std::path::Path,
+        _expected: &str,
+    ) -> RemoteFileResult<(RemoteFileEntry, String)> {
+        Err(RemoteFileError::new(
+            RemoteFileErrorCode::FailedPrecondition,
+            "conditional saves are not supported",
+        ))
+    }
+
     async fn list_shares(&self) -> RemoteFileResult<Vec<RemoteFileShare>>;
 
     async fn list_directory(
@@ -559,6 +747,63 @@ impl RemoteFileWireMessage for RemoteFileRequest {
         self.validate()?;
         let body = match self {
             Self::ListShares => Body::ListShares(proto::RemoteFileListSharesRequest {}),
+            Self::Stat {
+                share_id,
+                relative_path,
+            } => Body::Stat(proto::RemoteFileStatRequest {
+                share_id: share_id.clone(),
+                relative_path: relative_path.clone(),
+            }),
+            Self::Move {
+                share_id,
+                relative_path,
+                destination_path,
+                overwrite,
+                expected_revision,
+            } => Body::Move(proto::RemoteFileMoveRequest {
+                share_id: share_id.clone(),
+                relative_path: relative_path.clone(),
+                destination_path: destination_path.clone(),
+                overwrite: *overwrite,
+                expected_revision: expected_revision.clone(),
+            }),
+            Self::ConditionalDelete {
+                share_id,
+                relative_path,
+                expected_revision,
+                recursive,
+            } => Body::ConditionalDelete(proto::RemoteFileConditionalDeleteRequest {
+                share_id: share_id.clone(),
+                relative_path: relative_path.clone(),
+                expected_revision: expected_revision.clone(),
+                recursive: *recursive,
+            }),
+            Self::ReadRange {
+                share_id,
+                relative_path,
+                offset,
+                length,
+                revision,
+            } => Body::ReadRange(proto::RemoteFileReadRangeRequest {
+                share_id: share_id.clone(),
+                relative_path: relative_path.clone(),
+                offset: *offset,
+                length: *length,
+                revision: revision.clone(),
+            }),
+            Self::ConditionalUpload {
+                share_id,
+                relative_path,
+                name,
+                size,
+                expected_revision,
+            } => Body::ConditionalUpload(proto::RemoteFileConditionalUploadRequest {
+                share_id: share_id.clone(),
+                relative_path: relative_path.clone(),
+                name: name.clone(),
+                size: *size,
+                expected_revision: expected_revision.clone(),
+            }),
             Self::ListDirectory {
                 share_id,
                 relative_path,
@@ -645,6 +890,37 @@ impl RemoteFileWireMessage for RemoteFileRequest {
             .ok_or_else(|| "remote file request body is missing".to_owned())?
         {
             Body::ListShares(_) => Self::ListShares,
+            Body::Stat(r) => Self::Stat {
+                share_id: r.share_id,
+                relative_path: r.relative_path,
+            },
+            Body::Move(r) => Self::Move {
+                share_id: r.share_id,
+                relative_path: r.relative_path,
+                destination_path: r.destination_path,
+                overwrite: r.overwrite,
+                expected_revision: r.expected_revision,
+            },
+            Body::ConditionalDelete(r) => Self::ConditionalDelete {
+                share_id: r.share_id,
+                relative_path: r.relative_path,
+                expected_revision: r.expected_revision,
+                recursive: r.recursive,
+            },
+            Body::ReadRange(r) => Self::ReadRange {
+                share_id: r.share_id,
+                relative_path: r.relative_path,
+                offset: r.offset,
+                length: r.length,
+                revision: r.revision,
+            },
+            Body::ConditionalUpload(r) => Self::ConditionalUpload {
+                share_id: r.share_id,
+                relative_path: r.relative_path,
+                name: r.name,
+                size: r.size,
+                expected_revision: r.expected_revision,
+            },
             Body::ListDirectory(request) => Self::ListDirectory {
                 share_id: request.share_id,
                 relative_path: request.relative_path,
@@ -703,6 +979,8 @@ impl RemoteFileWireMessage for RemoteFileResponse {
             entry: self.entry.as_ref().map(encode_entry),
             thumbnail_size: self.thumbnail_size,
             thumbnail_media_type: self.thumbnail_media_type.clone(),
+            revision: self.revision.clone(),
+            range_data: self.range_data.clone(),
             error_code: self
                 .error
                 .as_ref()
@@ -737,6 +1015,8 @@ impl RemoteFileWireMessage for RemoteFileResponse {
             entry: frame.entry.map(decode_entry).transpose()?,
             thumbnail_size: frame.thumbnail_size,
             thumbnail_media_type: frame.thumbnail_media_type,
+            revision: frame.revision,
+            range_data: frame.range_data,
         };
         response.validate()?;
         Ok(response)
@@ -989,6 +1269,71 @@ mod tests {
                 sort_key: RemoteFileSortKey::Name,
                 sort_direction: RemoteFileSortDirection::Ascending,
             }
+        );
+    }
+
+    #[test]
+    fn system_folder_requests_round_trip_with_versions_and_bounds() {
+        let requests = [
+            RemoteFileRequest::Stat {
+                share_id: "home".into(),
+                relative_path: "".into(),
+            },
+            RemoteFileRequest::ReadRange {
+                share_id: "home".into(),
+                relative_path: "a".into(),
+                offset: 7,
+                length: 256,
+                revision: "v1".into(),
+            },
+            RemoteFileRequest::Move {
+                share_id: "home".into(),
+                relative_path: "a".into(),
+                destination_path: "folder/b".into(),
+                overwrite: false,
+                expected_revision: "v1".into(),
+            },
+            RemoteFileRequest::ConditionalDelete {
+                share_id: "home".into(),
+                relative_path: "a".into(),
+                expected_revision: "v1".into(),
+                recursive: false,
+            },
+            RemoteFileRequest::ConditionalUpload {
+                share_id: "home".into(),
+                relative_path: "".into(),
+                name: "空文件.txt".into(),
+                size: 0,
+                expected_revision: "".into(),
+            },
+        ];
+        for request in requests {
+            assert_eq!(
+                RemoteFileRequest::decode_wire(&request.encode_wire().unwrap()).unwrap(),
+                request
+            );
+        }
+        let mut read = RemoteFileRequest::ReadRange {
+            share_id: "home".into(),
+            relative_path: "a".into(),
+            offset: u64::MAX,
+            length: 1,
+            revision: "v1".into(),
+        };
+        assert!(read.validate().is_err());
+        if let RemoteFileRequest::ReadRange { offset, length, .. } = &mut read {
+            *offset = 0;
+            *length = MAX_REMOTE_RANGE_BYTES + 1;
+        }
+        assert!(read.validate().is_err());
+        let response = RemoteFileResponse {
+            revision: "v1".into(),
+            range_data: vec![0, 255, 42],
+            ..RemoteFileResponse::success()
+        };
+        assert_eq!(
+            RemoteFileResponse::decode_wire(&response.encode_wire().unwrap()).unwrap(),
+            response
         );
     }
 }

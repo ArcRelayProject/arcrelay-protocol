@@ -325,6 +325,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RemoteFileProvider for TestRemoteFileProvider {
+        async fn commit_system_upload(&self, _: &str, _: &str, name: &str, temporary: &std::path::Path, expected: &str) -> crate::remote_files::RemoteFileResult<(crate::remote_files::RemoteFileEntry, String)> {
+            if expected != "v1" { return Err(crate::remote_files::RemoteFileError::new(RemoteFileErrorCode::Conflict, "stale revision")); }
+            let destination = self.upload_destination.as_ref().unwrap();
+            tokio::fs::rename(temporary, destination).await.map_err(|e| test_remote_file_error(e.to_string()))?;
+            Ok((crate::remote_files::RemoteFileEntry { name: name.into(), relative_path: name.into(), kind: RemoteFileKind::File,
+                size: std::fs::metadata(destination).unwrap().len(), modified_at_ms: 1 }, "v2".into()))
+        }
         async fn list_shares(&self) -> crate::remote_files::RemoteFileResult<Vec<crate::remote_files::RemoteFileShare>> {
             Ok(vec![crate::remote_files::RemoteFileShare {
                 id: "home".into(),
@@ -495,6 +502,121 @@ mod tests {
         handler.await.unwrap().unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    async fn run_system_file_upload(
+        original: Option<&[u8]>,
+        bytes: &[u8],
+        declared_size: u64,
+        overwrite: bool,
+        expected: Option<&str>,
+    ) -> (RemoteFileResponse, Vec<u8>) {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("document.txt");
+        if let Some(original) = original {
+            std::fs::write(&destination, original).unwrap();
+        }
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut reader, mut writer) = tokio::io::split(client);
+        let (mut server_reader, mut server_writer) = tokio::io::split(server);
+        let provider = TestRemoteFileProvider {
+            upload_destination: Some(destination.clone()),
+            download_source: None,
+            thumbnail: None,
+        };
+        let handler = tokio::spawn(async move {
+            handle_remote_file_stream(
+                &mut server_writer, &mut server_reader,
+                Some(Arc::new(provider)), RemoteFileAccess::allow_all(),
+            ).await
+        });
+        let request = if let Some(expected) = expected { RemoteFileRequest::ConditionalUpload {
+            share_id: "home".into(), relative_path: "".into(), name: "document.txt".into(), size: declared_size, expected_revision: expected.into(),
+        } } else { RemoteFileRequest::Upload {
+            share_id: "home".into(), relative_path: "".into(),
+            name: "document.txt".into(), size: declared_size,
+            overwrite, expected_modified_at_ms: None,
+        } };
+        write_remote_message(&mut writer, &request).await.unwrap();
+        let ready: RemoteFileResponse = read_remote_message(&mut reader).await.unwrap();
+        assert!(ready.ok, "{:?}", ready.error);
+        writer.write_all(bytes).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let result = read_remote_message(&mut reader).await.unwrap();
+        handler.await.unwrap().unwrap();
+        let content = std::fs::read(&destination).unwrap();
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        (result, content)
+    }
+
+    #[tokio::test]
+    async fn system_file_upload_supports_empty_creation_and_truncation() {
+        for original in [None, Some(b"old contents".as_slice())] {
+            let (response, content) = run_system_file_upload(original, b"", 0, true, None).await;
+            assert!(response.ok, "{:?}", response.error);
+            assert!(content.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_upload_returns_committed_version_and_preserves_original_on_errors() {
+        let (response, content) = run_system_file_upload(Some(b"original"), b"", 0, true, Some("v1")).await;
+        assert!(response.ok);
+        assert_eq!(response.revision, "v2");
+        assert!(content.is_empty());
+        for (bytes, size, revision, code) in [
+            (b"replacement".as_slice(), 11, "stale", RemoteFileErrorCode::Conflict),
+            (b"partial".as_slice(), 100, "v1", RemoteFileErrorCode::Unavailable),
+            (b"too long".as_slice(), 2, "v1", RemoteFileErrorCode::InvalidArgument),
+        ] {
+            let (response, content) = run_system_file_upload(Some(b"original"), bytes, size, true, Some(revision)).await;
+            assert_eq!(response.error.unwrap().code, code);
+            assert_eq!(content, b"original");
+        }
+    }
+
+    #[tokio::test]
+    async fn system_file_operations_require_explicit_peer_permissions() {
+        for request in [
+            RemoteFileRequest::Stat { share_id: "home".into(), relative_path: "".into() },
+            RemoteFileRequest::ReadRange { share_id: "home".into(), relative_path: "a".into(), offset: 0, length: 1, revision: "v1".into() },
+            RemoteFileRequest::Move { share_id: "home".into(), relative_path: "a".into(), destination_path: "b".into(), overwrite: false, expected_revision: "v1".into() },
+            RemoteFileRequest::ConditionalDelete { share_id: "home".into(), relative_path: "a".into(), expected_revision: "v1".into(), recursive: true },
+            RemoteFileRequest::ConditionalUpload { share_id: "home".into(), relative_path: "".into(), name: "a".into(), size: 0, expected_revision: "".into() },
+        ] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (mut reader, mut writer) = tokio::io::split(client);
+            let (mut server_reader, mut server_writer) = tokio::io::split(server);
+            let handler = tokio::spawn(async move {
+                handle_remote_file_stream(&mut server_writer, &mut server_reader,
+                    Some(Arc::new(TestRemoteFileProvider { upload_destination: None, download_source: None, thumbnail: None })), RemoteFileAccess::default()).await
+            });
+            write_remote_message(&mut writer, &request).await.unwrap();
+            let response: RemoteFileResponse = read_remote_message(&mut reader).await.unwrap();
+            assert_eq!(response.error.unwrap().code, RemoteFileErrorCode::PermissionDenied);
+            handler.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn system_file_interrupted_save_preserves_original() {
+        let (response, content) = run_system_file_upload(Some(b"original"), b"partial", 100, true, None).await;
+        assert!(!response.ok);
+        assert_eq!(content, b"original");
+    }
+
+    #[tokio::test]
+    async fn system_file_create_does_not_replace_existing_destination() {
+        let (response, content) = run_system_file_upload(Some(b"original"), b"replacement", 11, false, None).await;
+        assert_eq!(response.error.unwrap().code, RemoteFileErrorCode::Conflict);
+        assert_eq!(content, b"original");
+    }
+
+    #[tokio::test]
+    async fn system_file_save_replaces_existing_destination() {
+        let (response, content) = run_system_file_upload(Some(b"original"), b"replacement", 11, true, None).await;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(content, b"replacement");
     }
 
     #[tokio::test]
