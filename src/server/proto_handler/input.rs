@@ -572,7 +572,65 @@ where
         RemoteFileResponse::failure(RemoteFileErrorCode::PermissionDenied, message)
     };
 
+    // Reuse the bounded upload stream, but commit system-folder saves through
+    // the domain service so revision checks and publication share one lock.
+    let (request, expected_revision) = match request {
+        RemoteFileRequest::ConditionalUpload { share_id, relative_path, name, size, expected_revision } => (
+            RemoteFileRequest::Upload {
+                share_id, relative_path, name, size,
+                overwrite: !expected_revision.is_empty(), expected_modified_at_ms: None,
+            },
+            Some(expected_revision),
+        ),
+        request => (request, None),
+    };
+
     match request {
+        RemoteFileRequest::ConditionalUpload { .. } => unreachable!("normalized above"),
+        RemoteFileRequest::Stat { share_id, relative_path } => {
+            let response = if !access.can_read(&share_id) {
+                denied("read access to this share is not permitted")
+            } else {
+                match provider.stat(&share_id, &relative_path).await {
+                    Ok((entry, revision)) => RemoteFileResponse { entry: Some(entry), revision, ..RemoteFileResponse::success() },
+                    Err(error) => RemoteFileResponse::from_error(error),
+                }
+            };
+            write_remote_message(send, &response).await?;
+        }
+        RemoteFileRequest::ConditionalDelete { share_id, relative_path, expected_revision, recursive } => {
+            let response = if !access.can_write(&share_id) {
+                denied("write access to this share is not permitted")
+            } else {
+                match provider.conditional_delete(&share_id, &relative_path, &expected_revision, recursive).await {
+                    Ok(()) => RemoteFileResponse::success(),
+                    Err(error) => RemoteFileResponse::from_error(error),
+                }
+            };
+            write_remote_message(send, &response).await?;
+        }
+        RemoteFileRequest::Move { share_id, relative_path, destination_path, overwrite, expected_revision } => {
+            let response = if !access.can_write(&share_id) {
+                denied("write access to this share is not permitted")
+            } else {
+                match provider.move_entry(&share_id, &relative_path, &destination_path, overwrite, &expected_revision).await {
+                    Ok(entry) => RemoteFileResponse { entry: Some(entry), ..RemoteFileResponse::success() },
+                    Err(error) => RemoteFileResponse::from_error(error),
+                }
+            };
+            write_remote_message(send, &response).await?;
+        }
+        RemoteFileRequest::ReadRange { share_id, relative_path, offset, length, revision } => {
+            let response = if !access.can_read(&share_id) {
+                denied("read access to this share is not permitted")
+            } else {
+                match provider.read_range(&share_id, &relative_path, offset, length, &revision).await {
+                    Ok(range_data) => RemoteFileResponse { range_data, revision, ..RemoteFileResponse::success() },
+                    Err(error) => RemoteFileResponse::from_error(error),
+                }
+            };
+            write_remote_message(send, &response).await?;
+        }
         RemoteFileRequest::ListShares => {
             if !access.can_list_shares() {
                 write_remote_message(send, &denied("remote file access is not permitted"))
@@ -808,7 +866,7 @@ where
                     .await?;
                 return Ok(());
             }
-            if size == 0 || size > crate::remote_files::MAX_REMOTE_FILE_CONTENT_SIZE {
+            if size > crate::remote_files::MAX_REMOTE_FILE_CONTENT_SIZE {
                 write_remote_message(
                     send,
                     &RemoteFileResponse::failure(
@@ -851,8 +909,12 @@ where
                 .parent()
                 .ok_or_else(|| ProtocolError::Other("invalid upload target directory".into()))?;
             let temporary = parent.join(format!(".arcrelay-upload-{}", uuid::Uuid::new_v4()));
+            let mut committed = None;
             let result: std::result::Result<(), RemoteFileError> = async {
-                let mut file = tokio::fs::File::create(&temporary)
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
                     .await
                     .map_err(|error| {
                         if error.kind() == std::io::ErrorKind::PermissionDenied {
@@ -867,10 +929,18 @@ where
                             )
                         }
                     })?;
-                let mut limited = recv.take(size);
+                let mut limited = (&mut *recv).take(size);
                 let received = tokio::io::copy(&mut limited, &mut file)
                     .await
                     .map_err(|error| RemoteFileError::new(RemoteFileErrorCode::Unavailable, format!("upload stream failed: {error}")))?;
+                drop(limited);
+                if expected_revision.is_some() && received == size {
+                    let mut extra = [0u8; 1];
+                    let trailing = tokio::time::timeout(std::time::Duration::from_secs(30), recv.read(&mut extra)).await
+                        .map_err(|_| RemoteFileError::new(RemoteFileErrorCode::Unavailable, "upload did not finish"))?
+                        .map_err(|e| RemoteFileError::new(RemoteFileErrorCode::Unavailable, e.to_string()))?;
+                    if trailing != 0 { return Err(RemoteFileError::new(RemoteFileErrorCode::InvalidArgument, "upload exceeds its declared size")); }
+                }
                 file.flush().await.map_err(|error| RemoteFileError::new(RemoteFileErrorCode::Unavailable, format!("failed to flush upload: {error}")))?;
                 file.sync_all().await.map_err(|error| RemoteFileError::new(RemoteFileErrorCode::Unavailable, format!("failed to synchronize upload: {error}")))?;
                 drop(file);
@@ -879,6 +949,10 @@ where
                         RemoteFileErrorCode::Unavailable,
                         format!("upload ended early: expected {size} bytes, received {received}"),
                     ));
+                }
+                if let Some(expected) = &expected_revision {
+                    committed = Some(provider.commit_system_upload(&share_id, &relative_path, &name, &temporary, expected).await?);
+                    return Ok(());
                 }
                 if let Some(expected) = upload.expected_modified_at_ms {
                     let metadata = tokio::fs::metadata(&upload.destination)
@@ -900,20 +974,26 @@ where
                         ));
                     }
                 }
-                if upload.destination.exists() {
-                    if !upload.overwrite {
-                        return Err(RemoteFileError::new(
-                            RemoteFileErrorCode::Conflict,
-                            "destination file already exists",
-                        ));
-                    }
-                    tokio::fs::remove_file(&upload.destination)
-                        .await
-                        .map_err(|error| RemoteFileError::new(RemoteFileErrorCode::Unavailable, format!("failed to replace destination file: {error}")))?;
+                // Never remove the old file before the new contents have been
+                // committed. rename replaces atomically on Unix and Windows.
+                if upload.overwrite {
+                    tokio::fs::rename(&temporary, &upload.destination).await
+                } else {
+                    // An existence check followed by rename would clobber a
+                    // destination concurrently created by another client.
+                    tokio::fs::hard_link(&temporary, &upload.destination).await
                 }
-                tokio::fs::rename(&temporary, &upload.destination)
-                    .await
-                    .map_err(|error| RemoteFileError::new(RemoteFileErrorCode::Unavailable, format!("failed to commit uploaded file: {error}")))?;
+                .map_err(|error| RemoteFileError::new(
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        RemoteFileErrorCode::Conflict
+                    } else {
+                        RemoteFileErrorCode::Unavailable
+                    },
+                    format!("failed to commit uploaded file: {error}"),
+                ))?;
+                if !upload.overwrite {
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                }
                 Ok(())
             }
             .await;
@@ -921,6 +1001,10 @@ where
                 let _ = tokio::fs::remove_file(&temporary).await;
             }
             let response = match result {
+                Ok(()) if committed.is_some() => {
+                    let (entry, revision) = committed.unwrap();
+                    RemoteFileResponse { entry: Some(entry), revision, ..RemoteFileResponse::success() }
+                }
                 Ok(()) => RemoteFileResponse {
                     entry: Some(upload.entry),
                     ..RemoteFileResponse::success()
