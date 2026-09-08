@@ -1,3 +1,5 @@
+#[cfg(feature = "host")]
+pub mod clipboard_replication;
 pub mod error;
 pub mod message;
 pub mod product;
