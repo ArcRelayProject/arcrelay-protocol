@@ -45,7 +45,7 @@ fn feature(feature: proto::Feature) -> proto::FeatureVersion {
     proto::FeatureVersion {
         feature: feature as i32,
         min_version: version,
-        max_version: version,
+        max_version: if feature == proto::Feature::ClipboardSync { crate::clipboard_replication::VERSION } else { version },
     }
 }
 
@@ -288,6 +288,16 @@ fn response_error(
 
 #[cfg(test)]
 mod feature_negotiation_tests {
+    #[test]
+    fn clipboard_replication_selects_v2_without_breaking_v1_clients() {
+        let modern = feature(proto::Feature::ClipboardSync);
+        let legacy = proto::FeatureVersion { feature: proto::Feature::ClipboardSync as i32, min_version: 1, max_version: 1 };
+        for (client, server, expected) in [(modern,modern,2),(legacy,modern,1),(modern,legacy,1)] {
+            let selected=negotiate_features(&[client],&[server]).unwrap();
+            assert_eq!(selected[&(proto::Feature::ClipboardSync as i32)],expected);
+        }
+    }
+
     use super::*;
 
     #[test]

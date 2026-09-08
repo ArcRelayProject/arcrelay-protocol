@@ -505,6 +505,8 @@ async fn handle_auxiliary_stream(
     clipboard_uploads: ClipboardUploadStore,
     blob_owner: Vec<u8>,
     clipboard_upload_allowed: bool,
+    replica_service: Option<Arc<arcrelay_core::application::clipboard_service::ClipboardApplicationService>>,
+    replica_limit: Arc<Semaphore>,
     remote_file_provider: Option<Arc<dyn RemoteFileProvider>>,
     remote_file_access: RemoteFileAccess,
 ) -> Result<()> {
@@ -512,6 +514,13 @@ async fn handle_auxiliary_stream(
         .await
         .map_err(|_| ProtocolError::Other("auxiliary stream preface timed out".into()))??;
     match kind {
+        arcrelay_wire::STREAM_KIND_CLIPBOARD_REPLICA => {
+            let service = replica_service.ok_or_else(|| ProtocolError::Other("clipboard replication is not authorized or negotiated".into()))?;
+            let _permit = replica_limit.try_acquire_owned().map_err(|_| ProtocolError::Other("too many clipboard replication streams".into()))?;
+            let result = crate::clipboard_replication::serve_stream(&mut send, &mut recv, &service).await.map_err(ProtocolError::Other);
+            let _ = send.finish();
+            result
+        }
         STREAM_KIND_BLOB_DOWNLOAD => tokio::time::timeout(
             BLOB_TRANSFER_TIMEOUT,
             handle_blob_stream(&mut send, &mut recv, blob_store, blob_owner),

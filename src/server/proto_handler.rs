@@ -385,7 +385,7 @@ pub(super) async fn handle_quic_connection(
         .register_transport_with_features(
             &device_id,
             connection.clone(),
-            negotiated_feature_versions,
+            negotiated_feature_versions.clone(),
         )
         .await;
     let _ = event_tx
@@ -422,6 +422,7 @@ pub(super) async fn handle_quic_connection(
         }
     });
 
+    let replica_limit = Arc::new(Semaphore::new(4));
     let request_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let (request_done_tx, mut request_done_rx) = mpsc::channel::<u64>(32);
     let mut request_tasks: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -592,6 +593,10 @@ pub(super) async fn handle_quic_connection(
             stream = connection.accept_bi() => {
                 match stream {
                     Ok((send, recv)) => {
+                        let replica_service = (negotiated_feature_versions.get(&(proto::Feature::ClipboardSync as i32)) == Some(&crate::clipboard_replication::VERSION)
+                            && granted_capabilities.contains(&CapabilityId::ClipboardSync))
+                            .then(|| coordinator.service().clipboard.clone());
+                        let replica_limit = replica_limit.clone();
                         let blob_store = blob_store.clone();
                         let clipboard_uploads = clipboard_uploads.clone();
                         let remote_file_provider = remote_file_provider.clone();
@@ -608,6 +613,8 @@ pub(super) async fn handle_quic_connection(
                                 clipboard_uploads,
                                 blob_owner,
                                 clipboard_upload_allowed,
+                                replica_service,
+                                replica_limit,
                                 remote_file_provider,
                                 remote_file_access,
                             ).await {
