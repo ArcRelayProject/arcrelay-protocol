@@ -690,3 +690,55 @@ async fn retention_keeps_recent_and_tagged_data_without_prune_redownload_cycles(
     assert_eq!(connection.fetches.load(Ordering::SeqCst), fetches);
     assert_eq!(second.total_records, 3);
 }
+
+#[tokio::test]
+async fn matching_retention_policies_converge_despite_device_local_file_history() {
+    use arcrelay_core::domain::clipboard::{ClipboardPayload, ClipboardRepository};
+    let a = database(None).await;
+    let mut policy = a.policy().await.unwrap();
+    policy.max_items = 3;
+    a.update_policy(policy.clone()).await.unwrap();
+    for index in 1..=3 {
+        a.apply_replica_record(record(index, "a")).await.unwrap();
+    }
+    let repository = TestClipboardRepository::open(None).await.unwrap();
+    repository.update_policy(policy).await.unwrap();
+    let prototype = a.history(ClipboardQuery::recent(10)).await.unwrap().entries[0].clone();
+    for index in 0..2 {
+        let mut summary = prototype.clone();
+        summary.kind = ClipboardContentKind::Files;
+        summary.character_count = None;
+        repository
+            .store_local(
+                ClipboardPayload::Files(vec![format!("/device-local/{index}")]),
+                format!("local-file-{index}"),
+                summary,
+            )
+            .await
+            .unwrap();
+    }
+    let b = repository.service();
+    let connection = link(a.clone(), b.clone()).await;
+    let first = reconcile(b.clone(), connection.right.clone())
+        .await
+        .unwrap();
+    assert!(first.converged, "{first:?}");
+    assert_eq!(first.total_records, 3);
+    assert_eq!(
+        a.replica_page(None, 10).await.unwrap().records,
+        b.replica_page(None, 10).await.unwrap().records
+    );
+    assert_eq!(
+        b.history(ClipboardQuery::recent(10))
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        5
+    );
+    let fetches = connection.fetches.load(Ordering::SeqCst);
+    let second = reconcile(b, connection.right.clone()).await.unwrap();
+    assert!(second.converged);
+    assert_eq!(second.received + second.sent, 0);
+    assert_eq!(connection.fetches.load(Ordering::SeqCst), fetches);
+}
