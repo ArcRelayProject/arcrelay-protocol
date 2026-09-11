@@ -496,6 +496,7 @@ mod tests {
             velocity_x: 0.0,
             velocity_y: 0.0,
             inverted_from_device: false,
+            finger_count: 0,
         })
     }
 
