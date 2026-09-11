@@ -63,6 +63,7 @@ pub(super) fn convert_reliable_events(
                     velocity_y: gesture.velocity_y,
                     // The mobile control-session protocol remains DockSwipe v1.
                     inverted_from_device: false,
+                    finger_count: 0,
                 }.validate_format(gesture.format_version).map_err(str::to_string)?;
                 DomainInputEvent::SystemGesture(gesture)
             }
