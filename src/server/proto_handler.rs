@@ -43,9 +43,15 @@ use super::input_session::{
 };
 use super::types::*;
 use super::wire::{
-    now_ms, read_stream_kind, recv_control, recv_message, recv_reliable_input, send_control,
-    send_message,
+    now_ms, read_stream_kind, recv_control, recv_control_buffered, recv_message,
+    recv_reliable_input, send_control, send_message,
 };
+
+mod lifecycle;
+#[cfg(test)]
+mod session_tests;
+use lifecycle::SessionTasks;
+pub(super) use lifecycle::TransportCloseGuard;
 
 const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(2 * 60);
@@ -318,28 +324,58 @@ impl<T> EventSubscription<T> {
     }
 }
 
+pub(super) struct ControlSessionServices {
+    pub coordinator: Arc<StateCoordinator>,
+    pub event_tx: mpsc::Sender<ServerEvent>,
+    pub action_provider: Option<Arc<dyn HostCapabilityProvider>>,
+    pub remote_file_provider: Option<Arc<dyn RemoteFileProvider>>,
+    pub registry: ConnectionRegistry,
+    pub input_sessions: InputSessionManager,
+    pub command_cache: Arc<Mutex<CommandCache>>,
+    pub command_limit: Arc<Semaphore>,
+    pub blob_store: BlobStore,
+    pub clipboard_uploads: ClipboardUploadStore,
+    pub workspace_input_router: Option<Arc<dyn WorkspaceInputRouter>>,
+}
+
+pub(super) struct ControlSessionPeer {
+    pub device_name: String,
+    pub device_id: String,
+    pub device_public_key: Vec<u8>,
+    pub server_features: Vec<proto::FeatureVersion>,
+    pub grants: Vec<Grant>,
+    pub remote_file_access: RemoteFileAccess,
+}
+
 pub(super) async fn handle_quic_connection(
     connection: quinn::Connection,
-    coordinator: Arc<StateCoordinator>,
-    event_tx: mpsc::Sender<ServerEvent>,
-    action_provider: Option<Arc<dyn HostCapabilityProvider>>,
-    remote_file_provider: Option<Arc<dyn RemoteFileProvider>>,
-    registry: ConnectionRegistry,
-    input_sessions: InputSessionManager,
-    command_cache: Arc<Mutex<CommandCache>>,
-    command_limit: Arc<Semaphore>,
-    blob_store: BlobStore,
-    clipboard_uploads: ClipboardUploadStore,
-    workspace_input_router: Option<Arc<dyn WorkspaceInputRouter>>,
-    mut control_send: quinn::SendStream,
-    mut control_recv: quinn::RecvStream,
-    device_name: String,
-    device_id: String,
-    device_public_key: Vec<u8>,
-    server_features: Vec<proto::FeatureVersion>,
-    grants: Vec<Grant>,
-    remote_file_access: RemoteFileAccess,
+    streams: (quinn::SendStream, quinn::RecvStream),
+    services: ControlSessionServices,
+    peer: ControlSessionPeer,
 ) -> Result<()> {
+    let _transport_guard = TransportCloseGuard(connection.clone());
+    let (mut control_send, mut control_recv) = streams;
+    let ControlSessionServices {
+        coordinator,
+        event_tx,
+        action_provider,
+        remote_file_provider,
+        registry,
+        input_sessions,
+        command_cache,
+        command_limit,
+        blob_store,
+        clipboard_uploads,
+        workspace_input_router,
+    } = services;
+    let ControlSessionPeer {
+        device_name,
+        device_id,
+        device_public_key,
+        server_features,
+        grants,
+        remote_file_access,
+    } = peer;
     let hello = tokio::time::timeout(STREAM_SETUP_TIMEOUT, recv_control(&mut control_recv))
         .await
         .map_err(|_| ProtocolError::Other("control hello timed out".into()))??;
@@ -381,6 +417,8 @@ pub(super) async fn handle_quic_connection(
     .await
     .map_err(|_| ProtocolError::Other("control welcome timed out".into()))??;
 
+    let active_input = Arc::new(Mutex::new(None::<InputLease>));
+    let input_apply_gate = input_sessions.apply_gate();
     let disconnect_signal = registry
         .register_transport_with_features(
             &device_id,
@@ -388,6 +426,43 @@ pub(super) async fn handle_quic_connection(
             negotiated_feature_versions.clone(),
         )
         .await;
+    let input_context = InputSessionContext {
+        coordinator: coordinator.clone(),
+        input_sessions: input_sessions.clone(),
+        active_input: active_input.clone(),
+        input_apply_gate: input_apply_gate.clone(),
+        event_tx: event_tx.clone(),
+        device_id: device_id.clone(),
+        device_name: device_name.clone(),
+        workspace_input_router: workspace_input_router.clone(),
+    };
+    let cleanup_registry = registry.clone();
+    let cleanup_signal = disconnect_signal.clone();
+    let cleanup_device_id = device_id.clone();
+    let cleanup_device_name = device_name.clone();
+    let cleanup_input = input_context.clone();
+    let mut tasks = SessionTasks::new(async move {
+        // Stop advertising this transport even if native input cleanup is slow.
+        cleanup_registry
+            .unregister(&cleanup_device_id, &cleanup_signal)
+            .await;
+        let _apply_guard = cleanup_input.input_apply_gate.lock().await;
+        let lease = *cleanup_input.active_input.lock().await;
+        if let Some(lease) = lease {
+            end_input_lease_locked(lease, &cleanup_input).await;
+        }
+        drop(_apply_guard);
+        let _ = tokio::time::timeout(
+            CRITICAL_SEND_TIMEOUT,
+            cleanup_input
+                .event_tx
+                .send(ServerEvent::DeviceDisconnected {
+                    device_id: cleanup_device_id,
+                    device_name: cleanup_device_name,
+                }),
+        )
+        .await;
+    });
     let _ = event_tx
         .send(ServerEvent::DeviceConnected {
             device_id: device_id.clone(),
@@ -404,7 +479,7 @@ pub(super) async fn handle_quic_connection(
     let writer_failed = Arc::new(Notify::new());
     let writer_failed_signal = writer_failed.clone();
     let writer_connection = connection.clone();
-    let writer = tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             let frame = tokio::select! {
                 biased;
@@ -425,9 +500,7 @@ pub(super) async fn handle_quic_connection(
     let replica_limit = Arc::new(Semaphore::new(4));
     let request_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let (request_done_tx, mut request_done_rx) = mpsc::channel::<u64>(32);
-    let mut request_tasks: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
-    let active_input = Arc::new(Mutex::new(None::<InputLease>));
-    let input_apply_gate = input_sessions.apply_gate();
+    let mut request_tasks: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     let reliable_input_stream_open = Arc::new(AtomicBool::new(false));
     let mut input_lease_tick = tokio::time::interval(Duration::from_secs(1));
     let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(5));
@@ -441,19 +514,30 @@ pub(super) async fn handle_quic_connection(
         })
         .flatten();
 
-    let mut system_sub: Option<StateSubscription<SystemVersioned>> = None;
-    let mut media_sub: Option<StateSubscription<MediaVersioned>> = None;
-    let mut window_sub: Option<StateSubscription<WindowVersioned>> = None;
-    let mut clipboard_sub: Option<StateSubscription<ClipboardVersioned>> = None;
-    let mut action_catalog_sub: Option<PassiveSubscription> = None;
-    let mut action_output_sub: Option<EventSubscription<OutputLine>> = None;
-    let mut notification_sub: Option<EventSubscription<()>> = None;
-    let mut clipboard_sync_sub: Option<
-        EventSubscription<arcrelay_core::domain::clipboard::ClipboardSyncRecord>,
-    > = None;
+    let mut subscriptions = ConnectionSubscriptions::default();
 
+    let request_context = RequestContext {
+        coordinator: coordinator.clone(),
+        action_provider: action_provider.clone(),
+        features: Arc::new(negotiated_features.clone()),
+        capabilities: Arc::new(granted_capabilities.clone()),
+        blob_store: blob_store.clone(),
+        clipboard_uploads: clipboard_uploads.clone(),
+        command_cache,
+        command_limit,
+        device_public_key: device_public_key.clone(),
+        device_id: device_id.clone(),
+        device_name: device_name.clone(),
+    };
+    let mut control_decoder = arcrelay_transport::FrameReader::new(MAX_CONTROL_FRAME_SIZE);
+    let result: Result<()> = async {
     loop {
         tokio::select! {
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "control session child task failed");
+                }
+            }
             _ = writer_failed.notified() => break,
             _ = disconnect_signal.notified() => {
                 connection.close(5_u32.into(), b"disconnected by desktop");
@@ -475,8 +559,10 @@ pub(super) async fn handle_quic_connection(
                     if let Some(lease) = owned_workspace_lease {
                         let _apply_guard = input_apply_gate.lock().await;
                         if active_input.lock().await.as_ref().is_some_and(|active| *active == lease) {
-                            *active_input.lock().await = None;
+                            let mut active = active_input.lock().await;
                             let _ = input_sessions.release(lease).await;
+                            *active = None;
+                            drop(active);
                             emit_input_ended(&event_tx, lease, &device_id, &device_name).await;
                         }
                     }
@@ -494,16 +580,7 @@ pub(super) async fn handle_quic_connection(
                 let lease = { *active_input.lock().await };
                 if let Some(lease) = lease {
                     if input_sessions.is_expired(lease, &device_id).await {
-                        end_input_lease_locked(
-                            lease,
-                            &active_input,
-                            &input_sessions,
-                            &coordinator,
-                            &event_tx,
-                            &device_id,
-                            &device_name,
-                            workspace_input_router.as_ref(),
-                        ).await;
+                        end_input_lease_locked(lease, &input_context).await;
                     } else {
                         let cancellations = input_sessions.cancel_idle_system_gesture(lease, &device_id).await;
                         if !cancellations.is_empty() {
@@ -532,7 +609,7 @@ pub(super) async fn handle_quic_connection(
                     connection.close(7_u32.into(), b"application heartbeat timed out");
                     break;
                 }
-                if let Some(subscription) = action_output_sub.as_mut() {
+                if let Some(subscription) = subscriptions.action_output_sub.as_mut() {
                     if let Some(first_missing_sequence) =
                         subscription.action_gap.first_missing_sequence.take()
                     {
@@ -559,29 +636,12 @@ pub(super) async fn handle_quic_connection(
             stream = connection.accept_uni() => {
                 match stream {
                     Ok(stream) => {
-                        let coordinator = coordinator.clone();
-                        let input_sessions = input_sessions.clone();
+                        let context = input_context.clone();
                         let critical_tx = critical_tx.clone();
-                        let active_input = active_input.clone();
-                        let input_apply_gate = input_apply_gate.clone();
                         let reliable_input_stream_open = reliable_input_stream_open.clone();
-                        let event_tx = event_tx.clone();
-                        let device_id = device_id.clone();
-                        let device_name = device_name.clone();
-                        let workspace_input_router = workspace_input_router.clone();
-                        tokio::spawn(async move {
+                        tasks.spawn(async move {
                             if let Err(error) = handle_uni_stream(
-                                stream,
-                                coordinator,
-                                input_sessions,
-                                critical_tx,
-                                active_input,
-                                input_apply_gate,
-                                reliable_input_stream_open,
-                                event_tx,
-                                device_id,
-                                device_name,
-                                workspace_input_router,
+                                stream, context, critical_tx, reliable_input_stream_open,
                             ).await {
                                 warn!(%error, "QUIC unidirectional stream ended");
                             }
@@ -605,18 +665,13 @@ pub(super) async fn handle_quic_connection(
                         let clipboard_upload_allowed = negotiated_features.contains(
                             &(proto::Feature::ClipboardSync as i32),
                         ) && granted_capabilities.contains(&CapabilityId::ClipboardSync);
-                        tokio::spawn(async move {
+                        tasks.spawn(async move {
                             if let Err(error) = handle_auxiliary_stream(
-                                send,
-                                recv,
-                                blob_store,
-                                clipboard_uploads,
-                                blob_owner,
-                                clipboard_upload_allowed,
-                                replica_service,
-                                replica_limit,
-                                remote_file_provider,
-                                remote_file_access,
+                                send, recv, AuxiliaryContext {
+                                    blob_store, clipboard_uploads, blob_owner,
+                                    clipboard_upload_allowed, replica_service, replica_limit,
+                                    remote_file_provider, remote_file_access,
+                                },
                             ).await {
                                 warn!(%error, "QUIC bidirectional stream ended");
                             }
@@ -625,7 +680,7 @@ pub(super) async fn handle_quic_connection(
                     Err(_) => break,
                 }
             }
-            frame = recv_control(&mut control_recv) => {
+            frame = recv_control_buffered(&mut control_recv, &mut control_decoder) => {
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(ProtocolError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -671,36 +726,13 @@ pub(super) async fn handle_quic_connection(
                             request.body.as_ref(),
                             Some(proto::request::Body::Command(_))
                         );
-                        let coordinator = coordinator.clone();
-                        let provider = action_provider.clone();
-                        let granted = granted_capabilities.clone();
-                        let negotiated = negotiated_features.clone();
-                        let blobs = blob_store.clone();
-                        let uploads = clipboard_uploads.clone();
-                        let commands = command_cache.clone();
-                        let command_permits = command_limit.clone();
-                        let authenticated_device_key = device_public_key.clone();
-                        let authenticated_device_id = device_id.clone();
-                        let authenticated_device_name = device_name.clone();
+                        let context = request_context.clone();
                         let critical = critical_tx.clone();
                         let done = request_done_tx.clone();
-                        let task = tokio::spawn(async move {
+                        let task = tasks.spawn(async move {
                             let _permit = permit;
                             let timeout = Duration::from_millis(request.timeout_ms.clamp(100, 120_000) as u64);
-                            let mut operation = tokio::spawn(handle_request(
-                                request,
-                                coordinator,
-                                provider,
-                                negotiated,
-                                granted,
-                                blobs,
-                                uploads,
-                                commands,
-                                command_permits,
-                                authenticated_device_key,
-                                authenticated_device_id,
-                                authenticated_device_name,
-                            ));
+                            let mut operation = tokio::spawn(handle_request(request, context));
                             let _abort_on_drop = TaskAbortGuard(operation.abort_handle());
                             let frame = match tokio::time::timeout(timeout, &mut operation).await {
                                 Ok(Ok(frame)) => frame,
@@ -767,14 +799,7 @@ pub(super) async fn handle_quic_connection(
                             &negotiated_features,
                             &granted_capabilities,
                             &critical_tx,
-                            &mut system_sub,
-                            &mut media_sub,
-                            &mut window_sub,
-                            &mut clipboard_sub,
-                            &mut action_catalog_sub,
-                            &mut action_output_sub,
-                            &mut notification_sub,
-                            &mut clipboard_sync_sub,
+                            &mut subscriptions,
                         ).await?;
                     }
                     Some(proto::client_control_frame::Body::Unsubscribe(request)) => {
@@ -797,14 +822,7 @@ pub(super) async fn handle_quic_connection(
                         handle_unsubscribe(
                             request,
                             &critical_tx,
-                            &mut system_sub,
-                            &mut media_sub,
-                            &mut window_sub,
-                            &mut clipboard_sub,
-                            &mut action_catalog_sub,
-                            &mut action_output_sub,
-                            &mut notification_sub,
-                            &mut clipboard_sync_sub,
+                            &mut subscriptions,
                         ).await?;
                     }
                     Some(proto::client_control_frame::Body::Ping(ping)) => {
@@ -843,17 +861,7 @@ pub(super) async fn handle_quic_connection(
                             break;
                         }
                         let frame = begin_input_session(
-                            request,
-                            &negotiated_features,
-                            &granted_capabilities,
-                            &coordinator,
-                            &input_sessions,
-                            &active_input,
-                            &input_apply_gate,
-                            &event_tx,
-                            &device_id,
-                            &device_name,
-                            workspace_input_router.as_ref(),
+                            request, &negotiated_features, &granted_capabilities, &input_context,
                         ).await;
                         send_critical(&critical_tx, frame).await?;
                     }
@@ -883,16 +891,7 @@ pub(super) async fn handle_quic_connection(
                         let lease = InputLease { session_id: request.session_id, epoch: request.epoch };
                         let matches = active_input.lock().await.as_ref().is_some_and(|active| *active == lease);
                         if matches {
-                            end_input_lease_locked(
-                                lease,
-                                &active_input,
-                                &input_sessions,
-                                &coordinator,
-                                &event_tx,
-                                &device_id,
-                                &device_name,
-                                workspace_input_router.as_ref(),
-                            ).await;
+                            end_input_lease_locked(lease, &input_context).await;
                         }
                         send_critical(&critical_tx, server_frame(
                             proto::server_control_frame::Body::InputSessionResult(
@@ -937,48 +936,48 @@ pub(super) async fn handle_quic_connection(
                     }
                 }
             }
-            update = recv_system(&mut system_sub) => {
+            update = recv_system(&mut subscriptions.system_sub) => {
                 if let Some(update) = update {
-                    push_system_event(&latest_state, system_sub.as_mut().unwrap(), update);
+                    push_system_event(&latest_state, subscriptions.system_sub.as_mut().unwrap(), update);
                 }
             }
-            update = recv_media(&mut media_sub) => {
+            update = recv_media(&mut subscriptions.media_sub) => {
                 if let Some(update) = update {
-                    push_media_event(&latest_state, media_sub.as_mut().unwrap(), update);
+                    push_media_event(&latest_state, subscriptions.media_sub.as_mut().unwrap(), update);
                 }
             }
-            update = recv_windows(&mut window_sub) => {
+            update = recv_windows(&mut subscriptions.window_sub) => {
                 if let Some(update) = update {
                     let spaces = current_spaces(&coordinator).await;
-                    push_window_event(&latest_state, window_sub.as_mut().unwrap(), update, spaces);
+                    push_window_event(&latest_state, subscriptions.window_sub.as_mut().unwrap(), update, spaces);
                 }
             }
-            update = recv_clipboard(&mut clipboard_sub) => {
+            update = recv_clipboard(&mut subscriptions.clipboard_sub) => {
                 if let Some(update) = update {
-                    push_clipboard_event(&latest_state, clipboard_sub.as_mut().unwrap(), update);
+                    push_clipboard_event(&latest_state, subscriptions.clipboard_sub.as_mut().unwrap(), update);
                 }
             }
-            output = recv_action_output(&mut action_output_sub) => {
+            output = recv_action_output(&mut subscriptions.action_output_sub) => {
                 if let Some(output) = output {
-                    push_action_output_event(&event_tx_out, action_output_sub.as_mut().unwrap(), output);
+                    push_action_output_event(&event_tx_out, subscriptions.action_output_sub.as_mut().unwrap(), output);
                 }
             }
-            change = recv_notification_change(&mut notification_sub) => {
+            change = recv_notification_change(&mut subscriptions.notification_sub) => {
                 if change.is_some() {
                     push_notification_event(
                         &latest_state,
-                        notification_sub.as_mut().unwrap(),
+                        subscriptions.notification_sub.as_mut().unwrap(),
                         action_provider.as_ref(),
                     ).await;
                 }
             }
-            change = recv_clipboard_sync(&mut clipboard_sync_sub) => {
+            change = recv_clipboard_sync(&mut subscriptions.clipboard_sync_sub) => {
                 if let Some(record) = change.filter(|record| {
                     coordinator.service().clipboard.should_send_sync_record(record)
                 }) {
                     push_clipboard_sync_event(
                         &event_tx_out,
-                        clipboard_sync_sub.as_mut().unwrap(),
+                        subscriptions.clipboard_sync_sub.as_mut().unwrap(),
                         record,
                         &blob_store,
                         &device_public_key,
@@ -988,36 +987,11 @@ pub(super) async fn handle_quic_connection(
         }
     }
 
-    for (_, task) in request_tasks {
-        task.abort();
-    }
-    let _apply_guard = input_apply_gate.lock().await;
-    let cleanup_lease = { *active_input.lock().await };
-    if let Some(lease) = cleanup_lease {
-        end_input_lease_locked(
-            lease,
-            &active_input,
-            &input_sessions,
-            &coordinator,
-            &event_tx,
-            &device_id,
-            &device_name,
-            workspace_input_router.as_ref(),
-        )
-        .await;
-    }
-    drop(critical_tx);
-    drop(event_tx_out);
-    writer.abort();
-    let _ = writer.await;
-    registry.unregister(&device_id, &disconnect_signal).await;
-    let _ = event_tx
-        .send(ServerEvent::DeviceDisconnected {
-            device_id,
-            device_name,
-        })
-        .await;
     Ok(())
+    }.await;
+    connection.close(0_u32.into(), b"control session ended");
+    tasks.shutdown().await;
+    result
 }
 
 async fn recv_workspace_input_change(

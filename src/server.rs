@@ -100,6 +100,7 @@ impl DesktopControlService {
     /// Desktop startup uses this to subscribe immediately after the network
     /// endpoint is bound, so authenticated sessions arriving during other
     /// backend initialization remain buffered for the control service.
+    // Public host adapters keep this stable startup API; session internals use contexts.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_incoming(
         self: Arc<Self>,
@@ -115,8 +116,18 @@ impl DesktopControlService {
             event = "desktop.control_service.ready",
             "desktop control service is ready for incoming sessions"
         );
+        let mut sessions = tokio::task::JoinSet::new();
         loop {
-            let session = match incoming.recv().await {
+            let incoming_session = tokio::select! {
+                result = sessions.join_next(), if !sessions.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        warn!(%error, "control service session task failed");
+                    }
+                    continue;
+                }
+                session = incoming.recv() => session,
+            };
+            let session = match incoming_session {
                 Ok(session) => session,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "control service lagged behind incoming sessions");
@@ -130,7 +141,7 @@ impl DesktopControlService {
                     let event_tx = event_tx.clone();
                     let pairing_tx = pairing_tx.clone();
                     let gate = self.pairing_gate.clone();
-                    tokio::spawn(async move {
+                    sessions.spawn(async move {
                         if let Err(error) =
                             handle_v1_pairing(network, session, event_tx, pairing_tx, gate).await
                         {
@@ -150,7 +161,7 @@ impl DesktopControlService {
                     let event_tx = event_tx.clone();
                     let action_provider = action_provider.clone();
                     let remote_file_provider = remote_file_provider.clone();
-                    tokio::spawn(async move {
+                    sessions.spawn(async move {
                         if let Err(error) = service
                             .serve_control_session(
                                 network,
@@ -180,6 +191,7 @@ impl DesktopControlService {
         action_provider: Option<Arc<dyn HostCapabilityProvider>>,
         remote_file_provider: Option<Arc<dyn crate::remote_files::RemoteFileProvider>>,
     ) -> Result<()> {
+        let _transport_guard = proto_handler::TransportCloseGuard(session.transport_handle());
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             session.accept_feature_stream(),
@@ -214,25 +226,28 @@ impl DesktopControlService {
             crate::remote_files::RemoteFileAccess::from_grants(&grants, GrantDirection::Inbound);
         proto_handler::handle_quic_connection(
             session.transport_handle(),
-            coordinator,
-            event_tx,
-            action_provider,
-            remote_file_provider,
-            self.connection_registry.clone(),
-            self.input_sessions.clone(),
-            self.command_cache.clone(),
-            self.command_limit.clone(),
-            self.blob_store.clone(),
-            self.clipboard_uploads.clone(),
-            self.workspace_input_router.clone(),
-            stream.send,
-            stream.receive,
-            session.peer().metadata.name.clone(),
-            session.peer().device_id.to_string(),
-            session.peer().public_key.as_bytes().to_vec(),
-            server_features,
-            grants,
-            remote_file_access,
+            (stream.send, stream.receive),
+            proto_handler::ControlSessionServices {
+                coordinator,
+                event_tx,
+                action_provider,
+                remote_file_provider,
+                registry: self.connection_registry.clone(),
+                input_sessions: self.input_sessions.clone(),
+                command_cache: self.command_cache.clone(),
+                command_limit: self.command_limit.clone(),
+                blob_store: self.blob_store.clone(),
+                clipboard_uploads: self.clipboard_uploads.clone(),
+                workspace_input_router: self.workspace_input_router.clone(),
+            },
+            proto_handler::ControlSessionPeer {
+                device_name: session.peer().metadata.name.clone(),
+                device_id: session.peer().device_id.to_string(),
+                device_public_key: session.peer().public_key.as_bytes().to_vec(),
+                server_features,
+                grants,
+                remote_file_access,
+            },
         )
         .await
     }

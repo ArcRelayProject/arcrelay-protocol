@@ -198,12 +198,12 @@ impl InputSessionManager {
         &self,
         lease: InputLease,
         device_id: &str,
-        pointer_total_x_256: i64,
-        pointer_total_y_256: i64,
-        scroll_total_x_256: i64,
-        scroll_total_y_256: i64,
+        pointer_total_256: [i64; 2],
+        scroll_total_256: [i64; 2],
         precise_scroll: bool,
     ) -> std::result::Result<MotionDelta, String> {
+        let [pointer_total_x_256, pointer_total_y_256] = pointer_total_256;
+        let [scroll_total_x_256, scroll_total_y_256] = scroll_total_256;
         let mut state = self.state.lock().await;
         let current = state
             .active
@@ -615,7 +615,7 @@ mod tests {
             .await
             .unwrap();
         let phone_motion = manager
-            .accept_ordered_motion(phone, "phone", 256, 0, 0, 0, true)
+            .accept_ordered_motion(phone, "phone", [256, 0], [0, 0], true)
             .await
             .unwrap();
         assert_eq!(phone_motion.pointer_x_256, 256);
@@ -702,7 +702,7 @@ mod tests {
             .await
             .unwrap();
         let first = manager
-            .accept_ordered_motion(lease, "device", 384, -128, 0, 0, true)
+            .accept_ordered_motion(lease, "device", [384, -128], [0, 0], true)
             .await
             .unwrap();
         assert_eq!(first.pointer_x_256, 384);
@@ -713,7 +713,7 @@ mod tests {
             .await
             .unwrap();
         let next = manager
-            .accept_ordered_motion(lease, "device", 512, -64, 0, 0, true)
+            .accept_ordered_motion(lease, "device", [512, -64], [0, 0], true)
             .await
             .unwrap();
         assert_eq!(next.pointer_x_256, 128);

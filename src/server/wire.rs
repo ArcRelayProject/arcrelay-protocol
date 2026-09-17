@@ -45,6 +45,15 @@ pub async fn recv_control<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Client
     recv_message(reader, MAX_CONTROL_FRAME_SIZE).await
 }
 
+pub async fn recv_control_buffered<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    decoder: &mut arcrelay_transport::FrameReader,
+) -> Result<ClientControlFrame> {
+    let bytes = decoder.read(reader).await.map_err(map_frame_error)?;
+    ClientControlFrame::decode(bytes)
+        .map_err(|error| ProtocolError::Other(format!("protobuf decode failed: {error}")))
+}
+
 pub async fn send_control<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &ServerControlFrame,

@@ -39,6 +39,7 @@ struct BlobStoreInner {
     device_entries: HashMap<Vec<u8>, usize>,
     device_tickets: HashMap<Vec<u8>, usize>,
     total_bytes: usize,
+    next_prune_at: Option<Instant>,
 }
 
 struct BlobEntry {
@@ -74,6 +75,7 @@ impl BlobStore {
                 device_entries: HashMap::new(),
                 device_tickets: HashMap::new(),
                 total_bytes: 0,
+                next_prune_at: None,
             })),
         }
     }
@@ -140,13 +142,15 @@ impl BlobStore {
             sha256: digest.clone(),
         };
         inner.total_bytes = inner.total_bytes.saturating_add(bytes.len());
+        let now = Instant::now();
+        inner.schedule_prune(now + BLOB_IDLE_TTL);
         inner.insertion_order.push_back(digest.clone());
         inner.entries.insert(
             digest,
             BlobEntry {
                 reference: reference.clone(),
                 bytes: Bytes::from(bytes),
-                last_access: Instant::now(),
+                last_access: now,
                 owners: HashSet::from([owner.to_vec()]),
                 delivered_owners: HashSet::new(),
             },
@@ -200,13 +204,15 @@ impl BlobStore {
                 break value;
             }
         };
+        let expires_at = Instant::now() + TICKET_TTL;
+        inner.schedule_prune(expires_at);
         inner.tickets.insert(
             ticket.clone(),
             TicketEntry {
                 transfer_id,
                 blob_id: blob_id.to_vec(),
                 owner: owner.to_vec(),
-                expires_at: Instant::now() + TICKET_TTL,
+                expires_at,
             },
         );
         inner.transfer_ids.insert(transfer_id);
@@ -257,28 +263,55 @@ impl BlobStore {
 }
 
 impl BlobStoreInner {
+    fn schedule_prune(&mut self, deadline: Instant) {
+        self.next_prune_at = Some(
+            self.next_prune_at
+                .map_or(deadline, |next| next.min(deadline)),
+        );
+    }
+
+    fn owner_has_room(&self, owner: &[u8], bytes: usize, entries: usize) -> bool {
+        self.device_bytes
+            .get(owner)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(bytes)
+            <= MAX_CACHED_BLOB_BYTES_PER_DEVICE
+            && self
+                .device_entries
+                .get(owner)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(entries)
+                <= MAX_CACHED_BLOBS_PER_DEVICE
+    }
+
     fn reclaim_delivered_for_owner(
         &mut self,
         owner: &[u8],
         additional_bytes: usize,
         additional_entries: usize,
     ) {
-        let candidates = self.insertion_order.iter().cloned().collect::<Vec<_>>();
-        for blob_id in candidates {
-            let owned_bytes = self.device_bytes.get(owner).copied().unwrap_or_default();
-            let owned_entries = self.device_entries.get(owner).copied().unwrap_or_default();
-            if owned_bytes.saturating_add(additional_bytes) <= MAX_CACHED_BLOB_BYTES_PER_DEVICE
-                && owned_entries.saturating_add(additional_entries) <= MAX_CACHED_BLOBS_PER_DEVICE
-            {
+        if self.owner_has_room(owner, additional_bytes, additional_entries) {
+            return;
+        }
+        // Only the pressure path walks the insertion order. Move IDs instead
+        // of cloning every hash, and remove reclaimed IDs immediately.
+        let mut candidates = std::mem::take(&mut self.insertion_order);
+        while let Some(blob_id) = candidates.pop_front() {
+            if self.owner_has_room(owner, additional_bytes, additional_entries) {
+                self.insertion_order.push_back(blob_id);
                 break;
             }
             if self.blob_has_ticket(&blob_id) {
+                self.insertion_order.push_back(blob_id);
                 continue;
             }
             let Some(entry) = self.entries.get_mut(&blob_id) else {
                 continue;
             };
             if !entry.delivered_owners.remove(owner) || !entry.owners.remove(owner) {
+                self.insertion_order.push_back(blob_id);
                 continue;
             }
             let size = entry.bytes.len();
@@ -287,8 +320,11 @@ impl BlobStoreInner {
             decrement_counter(&mut self.device_entries, owner, 1);
             if remove_entry {
                 self.remove_entry(&blob_id);
+            } else {
+                self.insertion_order.push_back(blob_id);
             }
         }
+        self.insertion_order.extend(candidates);
     }
 
     fn blob_has_ticket(&self, blob_id: &[u8]) -> bool {
@@ -299,6 +335,10 @@ impl BlobStoreInner {
 
     fn prune(&mut self) {
         let now = Instant::now();
+        if self.next_prune_at.is_none_or(|deadline| now < deadline) {
+            return;
+        }
+        self.next_prune_at = None;
         let expired_tickets = self
             .tickets
             .iter()
@@ -308,6 +348,7 @@ impl BlobStoreInner {
         for ticket in expired_tickets {
             self.remove_ticket(&ticket);
         }
+        self.next_prune_at = self.tickets.values().map(|entry| entry.expires_at).min();
 
         let insertion_order = std::mem::take(&mut self.insertion_order);
         for blob_id in insertion_order {
@@ -318,6 +359,11 @@ impl BlobStoreInner {
             if expired {
                 self.remove_entry(&blob_id);
             } else {
+                if !pinned {
+                    if let Some(entry) = self.entries.get(&blob_id) {
+                        self.schedule_prune(entry.last_access + BLOB_IDLE_TTL);
+                    }
+                }
                 self.insertion_order.push_back(blob_id);
             }
         }
@@ -407,6 +453,88 @@ fn decrement_counter(map: &mut HashMap<Vec<u8>, usize>, owner: &[u8], amount: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_pruning_preserves_pinned_blobs_and_removes_expired_tickets() {
+        let store = BlobStore::new();
+        let owner = [1; 32];
+        let blob = store
+            .insert(&owner, b"pinned".to_vec(), "image/png")
+            .unwrap();
+        let ticket = store.issue_ticket(&owner, &blob.blob_id).unwrap();
+        let mut inner = lock(&store.inner);
+        inner.entries.get_mut(&blob.blob_id).unwrap().last_access =
+            Instant::now() - BLOB_IDLE_TTL - Duration::from_secs(1);
+        inner.next_prune_at = Some(Instant::now());
+        inner.prune();
+        assert!(inner.entries.contains_key(&blob.blob_id));
+        assert!(inner.next_prune_at.is_some());
+        inner.tickets.get_mut(&ticket.ticket).unwrap().expires_at = Instant::now();
+        inner.next_prune_at = Some(Instant::now());
+        inner.prune();
+        assert!(inner.entries.is_empty());
+        assert!(inner.tickets.is_empty());
+        assert!(inner.device_bytes.is_empty());
+        assert!(inner.device_tickets.is_empty());
+        assert!(inner.next_prune_at.is_none());
+    }
+
+    #[test]
+    fn repeated_reclamation_does_not_accumulate_stale_insertion_ids() {
+        let store = BlobStore::new();
+        let owner = [1; 32];
+        for index in 0..MAX_CACHED_BLOBS_PER_DEVICE + 100 {
+            let blob = store
+                .insert(&owner, index.to_le_bytes().to_vec(), "image/png")
+                .unwrap();
+            let ticket = store.issue_ticket(&owner, &blob.blob_id).unwrap();
+            store
+                .redeem(&owner, ticket.transfer_id, &ticket.ticket)
+                .unwrap();
+        }
+        let inner = lock(&store.inner);
+        assert_eq!(inner.entries.len(), MAX_CACHED_BLOBS_PER_DEVICE);
+        assert_eq!(inner.insertion_order.len(), inner.entries.len());
+    }
+
+    #[test]
+    #[ignore = "deterministic full-cache ticket latency benchmark"]
+    fn performance_full_cache_ticket_round_trip() {
+        let store = BlobStore::new();
+        let mut target = None;
+        for index in 0..MAX_CACHED_BLOBS {
+            let owner = (index / MAX_CACHED_BLOBS_PER_DEVICE).to_le_bytes();
+            target = Some((
+                owner,
+                store
+                    .insert(&owner, index.to_le_bytes().to_vec(), "image/png")
+                    .unwrap(),
+            ));
+        }
+        let (owner, blob) = target.unwrap();
+        for forced_scan in [true, false] {
+            let mut samples = Vec::new();
+            for _ in 0..200 {
+                if forced_scan {
+                    lock(&store.inner).next_prune_at = Some(Instant::now());
+                }
+                let started = Instant::now();
+                let ticket = store.issue_ticket(&owner, &blob.blob_id).unwrap();
+                store
+                    .redeem(&owner, ticket.transfer_id, &ticket.ticket)
+                    .unwrap();
+                samples.push(started.elapsed());
+            }
+            samples.sort_unstable();
+            println!(
+                "blob_cache entries={} forced_scan={forced_scan} samples={} p50_us={} p95_us={}",
+                MAX_CACHED_BLOBS,
+                samples.len(),
+                samples[100].as_micros(),
+                samples[190].as_micros()
+            );
+        }
+    }
 
     #[test]
     fn blob_ids_are_content_hashes_and_tickets_are_single_use() {
