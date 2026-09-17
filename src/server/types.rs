@@ -79,12 +79,7 @@ pub struct AutomationInfo {
     pub total_steps: u32,
 }
 
-/// A single line of output from an action process (for broadcast).
-#[derive(Debug, Clone)]
-pub struct OutputLine {
-    pub action_id: String,
-    pub text: String,
-}
+pub use arcrelay_core::domain::action_output::OutputLine;
 
 /// A durable Host notification exposed to trusted mobile clients.
 #[derive(Debug, Clone)]

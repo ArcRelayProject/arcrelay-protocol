@@ -1,16 +1,32 @@
+#[derive(Clone)]
+struct InputSessionContext {
+    coordinator: Arc<StateCoordinator>,
+    input_sessions: InputSessionManager,
+    active_input: Arc<Mutex<Option<InputLease>>>,
+    input_apply_gate: Arc<Mutex<()>>,
+    event_tx: mpsc::Sender<ServerEvent>,
+    device_id: String,
+    device_name: String,
+    workspace_input_router: Option<Arc<dyn WorkspaceInputRouter>>,
+}
+
 async fn begin_input_session(
     request: proto::BeginInputSessionRequest,
     features: &HashSet<i32>,
     capabilities: &HashSet<CapabilityId>,
-    coordinator: &Arc<StateCoordinator>,
-    input_sessions: &InputSessionManager,
-    active_input: &Arc<Mutex<Option<InputLease>>>,
-    input_apply_gate: &Arc<Mutex<()>>,
-    event_tx: &mpsc::Sender<ServerEvent>,
-    device_id: &str,
-    device_name: &str,
-    workspace_input_router: Option<&Arc<dyn WorkspaceInputRouter>>,
+    context: &InputSessionContext,
 ) -> proto::ServerControlFrame {
+    let InputSessionContext {
+        coordinator,
+        input_sessions,
+        active_input,
+        input_apply_gate,
+        event_tx,
+        device_id,
+        device_name,
+        workspace_input_router,
+    } = context;
+    let workspace_input_router = workspace_input_router.as_ref();
     let permission = coordinator.service().input_control.permission_state();
     if !features.contains(&(proto::Feature::InputReliable as i32)) {
         return server_frame(proto::server_control_frame::Body::InputSessionResult(
@@ -84,23 +100,18 @@ async fn begin_input_session(
     let _apply_guard = input_apply_gate.lock().await;
     let previous = *active_input.lock().await;
     if let Some(previous) = previous {
-        end_input_lease_locked(
-            previous,
-            active_input,
-            input_sessions,
-            coordinator,
-            event_tx,
-            device_id,
-            device_name,
-            workspace_input_router,
-        )
-        .await;
+        end_input_lease_locked(previous, context).await;
     }
+    // Hold the local lease slot across acquisition: cancellation can never
+    // leave the manager's accepted lease without an owning cleanup context.
+    let mut active = active_input.lock().await;
     match input_sessions
         .acquire_with_routing(device_id, device_name, workspace_routed)
         .await
     {
         Ok(lease) => {
+            *active = Some(lease);
+            drop(active);
             let route = if workspace_routed {
                 match workspace_input_router
                     .expect("workspace router was validated")
@@ -109,23 +120,27 @@ async fn begin_input_session(
                 {
                     Ok(route) => Some(route),
                     Err(error) => {
-                        let _ = input_sessions.release(lease).await;
-                        return server_frame(proto::server_control_frame::Body::InputSessionResult(
-                            input_session_result(
-                                request.request_id,
-                                false,
-                                InputLease { session_id: 0, epoch: 0 },
-                                permission,
-                                &error.message,
-                                error.code.protocol_code(),
+                        end_input_lease_locked(lease, context).await;
+                        return server_frame(
+                            proto::server_control_frame::Body::InputSessionResult(
+                                input_session_result(
+                                    request.request_id,
+                                    false,
+                                    InputLease {
+                                        session_id: 0,
+                                        epoch: 0,
+                                    },
+                                    permission,
+                                    &error.message,
+                                    error.code.protocol_code(),
+                                ),
                             ),
-                        ));
+                        );
                     }
                 }
             } else {
                 None
             };
-            *active_input.lock().await = Some(lease);
             let _ = event_tx
                 .send(ServerEvent::InputSessionStarted {
                     session_id: lease_label(lease),
@@ -136,21 +151,32 @@ async fn begin_input_session(
             server_frame(proto::server_control_frame::Body::InputSessionResult(
                 proto::InputSessionResult {
                     supports_system_gestures: route.as_ref().map_or_else(
-                        || coordinator.service().input_control.supports_system_gestures(),
+                        || {
+                            coordinator
+                                .service()
+                                .input_control
+                                .supports_system_gestures()
+                        },
                         |route| route.supports_system_gestures,
                     ),
                     workspace_routing_active: workspace_routed,
-                    gateway_device_id: route.as_ref().map_or_else(String::new, |route| route.controller_device_id.clone()),
-                    logical_target_device_id: route.as_ref().map_or_else(String::new, |route| route.logical_target_device_id.clone()),
-                    target_display_id: route.as_ref().map_or_else(String::new, |route| route.target_display_id.clone()),
+                    gateway_device_id: route
+                        .as_ref()
+                        .map_or_else(String::new, |route| route.controller_device_id.clone()),
+                    logical_target_device_id: route
+                        .as_ref()
+                        .map_or_else(String::new, |route| route.logical_target_device_id.clone()),
+                    target_display_id: route
+                        .as_ref()
+                        .map_or_else(String::new, |route| route.target_display_id.clone()),
                     control_epoch: route.as_ref().map_or(0, |route| route.control_epoch),
                     ..input_session_result(
-                    request.request_id,
-                    true,
-                    lease,
-                    permission,
-                    "",
-                    proto::ErrorCode::Ok,
+                        request.request_id,
+                        true,
+                        lease,
+                        permission,
+                        "",
+                        proto::ErrorCode::Ok,
                     )
                 },
             ))
@@ -211,17 +237,22 @@ fn input_session_result(
 
 async fn handle_uni_stream(
     mut stream: quinn::RecvStream,
-    coordinator: Arc<StateCoordinator>,
-    input_sessions: InputSessionManager,
+    context: InputSessionContext,
     critical_tx: mpsc::Sender<proto::ServerControlFrame>,
-    active_input: Arc<Mutex<Option<InputLease>>>,
-    input_apply_gate: Arc<Mutex<()>>,
     reliable_input_stream_open: Arc<AtomicBool>,
-    event_tx: mpsc::Sender<ServerEvent>,
-    device_id: String,
-    device_name: String,
-    workspace_input_router: Option<Arc<dyn WorkspaceInputRouter>>,
 ) -> Result<()> {
+    let context = &context;
+    let InputSessionContext {
+        coordinator,
+        input_sessions,
+        active_input,
+        input_apply_gate,
+        event_tx,
+        device_id,
+        device_name: _,
+        workspace_input_router,
+    } = context;
+    let workspace_input_router = workspace_input_router.as_ref();
     let kind = tokio::time::timeout(STREAM_SETUP_TIMEOUT, read_stream_kind(&mut stream))
         .await
         .map_err(|_| ProtocolError::Other("input stream preface timed out".into()))??;
@@ -249,17 +280,7 @@ async fn handle_uni_stream(
                 let _apply_guard = input_apply_gate.lock().await;
                 let lease = { *active_input.lock().await };
                 if let Some(lease) = lease {
-                    end_input_lease_locked(
-                        lease,
-                        &active_input,
-                        &input_sessions,
-                        &coordinator,
-                        &event_tx,
-                        &device_id,
-                        &device_name,
-                        workspace_input_router.as_ref(),
-                    )
-                    .await;
+                    end_input_lease_locked(lease, context).await;
                 }
                 return if clean_end { Ok(()) } else { Err(error) };
             }
@@ -277,14 +298,8 @@ async fn handle_uni_stream(
             revoke_input_with_feedback(
                 lease,
                 "invalid reliable input event count",
-                &active_input,
-                &input_sessions,
-                &coordinator,
+                context,
                 &critical_tx,
-                &event_tx,
-                &device_id,
-                &device_name,
-                workspace_input_router.as_ref(),
             )
             .await;
             continue;
@@ -293,19 +308,7 @@ async fn handle_uni_stream(
             Ok(events) => events,
             Err(error) => {
                 let _apply_guard = input_apply_gate.lock().await;
-                revoke_input_with_feedback(
-                    lease,
-                    &error,
-                    &active_input,
-                    &input_sessions,
-                    &coordinator,
-                    &critical_tx,
-                    &event_tx,
-                    &device_id,
-                    &device_name,
-                    workspace_input_router.as_ref(),
-                )
-                .await;
+                revoke_input_with_feedback(lease, &error, context, &critical_tx).await;
                 continue;
             }
         };
@@ -314,76 +317,34 @@ async fn handle_uni_stream(
             revoke_input_with_feedback(
                 lease,
                 "ordered input frame mixes motion and discrete events",
-                &active_input,
-                &input_sessions,
-                &coordinator,
+                context,
                 &critical_tx,
-                &event_tx,
-                &device_id,
-                &device_name,
-                workspace_input_router.as_ref(),
             )
             .await;
             continue;
         }
         let apply_guard = input_apply_gate.lock().await;
         if let Err(error) = coordinator.service().input_control.validate_events(&events) {
-            revoke_input_with_feedback(
-                lease,
-                &error.to_string(),
-                &active_input,
-                &input_sessions,
-                &coordinator,
-                &critical_tx,
-                &event_tx,
-                &device_id,
-                &device_name,
-                workspace_input_router.as_ref(),
-            )
-            .await;
+            revoke_input_with_feedback(lease, &error.to_string(), context, &critical_tx).await;
             continue;
         }
         let sequences = match input_sessions
-            .accept_reliable(lease, &device_id, frame.sequence, frame.elapsed_us, 0)
+            .accept_reliable(lease, device_id, frame.sequence, frame.elapsed_us, 0)
             .await
         {
             Ok(sequences) => sequences,
             Err(error) => {
-                revoke_input_with_feedback(
-                    lease,
-                    &error,
-                    &active_input,
-                    &input_sessions,
-                    &coordinator,
-                    &critical_tx,
-                    &event_tx,
-                    &device_id,
-                    &device_name,
-                    workspace_input_router.as_ref(),
-                )
-                .await;
+                revoke_input_with_feedback(lease, &error, context, &critical_tx).await;
                 continue;
             }
         };
         let mut input_events = match input_sessions
-            .normalize_reliable_events(lease, &device_id, events)
+            .normalize_reliable_events(lease, device_id, events)
             .await
         {
             Ok(events) => events,
             Err(error) => {
-                revoke_input_with_feedback(
-                    lease,
-                    &error,
-                    &active_input,
-                    &input_sessions,
-                    &coordinator,
-                    &critical_tx,
-                    &event_tx,
-                    &device_id,
-                    &device_name,
-                    workspace_input_router.as_ref(),
-                )
-                .await;
+                revoke_input_with_feedback(lease, &error, context, &critical_tx).await;
                 continue;
             }
         };
@@ -391,30 +352,16 @@ async fn handle_uni_stream(
             let delta = match input_sessions
                 .accept_ordered_motion(
                     lease,
-                    &device_id,
-                    motion.pointer_total_x_256,
-                    motion.pointer_total_y_256,
-                    motion.scroll_total_x_256,
-                    motion.scroll_total_y_256,
+                    device_id,
+                    [motion.pointer_total_x_256, motion.pointer_total_y_256],
+                    [motion.scroll_total_x_256, motion.scroll_total_y_256],
                     motion.precise_scroll,
                 )
                 .await
             {
                 Ok(delta) => delta,
                 Err(error) => {
-                    revoke_input_with_feedback(
-                        lease,
-                        &error,
-                        &active_input,
-                        &input_sessions,
-                        &coordinator,
-                        &critical_tx,
-                        &event_tx,
-                        &device_id,
-                        &device_name,
-                        workspace_input_router.as_ref(),
-                    )
-                    .await;
+                    revoke_input_with_feedback(lease, &error, context, &critical_tx).await;
                     continue;
                 }
             };
@@ -437,15 +384,9 @@ async fn handle_uni_stream(
         };
         if !input_events.is_empty() {
             let apply_started = Instant::now();
-            let apply_result = if input_sessions
-                .is_workspace_routed(lease, &device_id)
-                .await
-            {
+            let apply_result = if input_sessions.is_workspace_routed(lease, device_id).await {
                 match workspace_input_router.as_ref() {
-                    Some(router) => router
-                        .apply(&device_id, &input_events)
-                        .await
-                        .map(|_| ()),
+                    Some(router) => router.apply(device_id, &input_events).await.map(|_| ()),
                     None => Err(HostCapabilityError::new(
                         HostCapabilityErrorCode::Unavailable,
                         "workspace input router became unavailable",
@@ -465,19 +406,7 @@ async fn handle_uni_stream(
                     })
             };
             if let Err(error) = apply_result {
-                revoke_input_with_feedback(
-                    lease,
-                    &error.to_string(),
-                    &active_input,
-                    &input_sessions,
-                    &coordinator,
-                    &critical_tx,
-                    &event_tx,
-                    &device_id,
-                    &device_name,
-                    workspace_input_router.as_ref(),
-                )
-                .await;
+                revoke_input_with_feedback(lease, &error.to_string(), context, &critical_tx).await;
                 continue;
             }
             if is_motion_frame {
@@ -498,26 +427,48 @@ async fn handle_uni_stream(
     }
 }
 
-async fn handle_auxiliary_stream(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+#[derive(Clone)]
+struct AuxiliaryContext {
     blob_store: BlobStore,
     clipboard_uploads: ClipboardUploadStore,
     blob_owner: Vec<u8>,
     clipboard_upload_allowed: bool,
-    replica_service: Option<Arc<arcrelay_core::application::clipboard_service::ClipboardApplicationService>>,
+    replica_service:
+        Option<Arc<arcrelay_core::application::clipboard_service::ClipboardApplicationService>>,
     replica_limit: Arc<Semaphore>,
     remote_file_provider: Option<Arc<dyn RemoteFileProvider>>,
     remote_file_access: RemoteFileAccess,
+}
+
+async fn handle_auxiliary_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    context: AuxiliaryContext,
 ) -> Result<()> {
+    let AuxiliaryContext {
+        blob_store,
+        clipboard_uploads,
+        blob_owner,
+        clipboard_upload_allowed,
+        replica_service,
+        replica_limit,
+        remote_file_provider,
+        remote_file_access,
+    } = context;
     let kind = tokio::time::timeout(STREAM_SETUP_TIMEOUT, read_stream_kind(&mut recv))
         .await
         .map_err(|_| ProtocolError::Other("auxiliary stream preface timed out".into()))??;
     match kind {
         arcrelay_wire::STREAM_KIND_CLIPBOARD_REPLICA => {
-            let service = replica_service.ok_or_else(|| ProtocolError::Other("clipboard replication is not authorized or negotiated".into()))?;
-            let _permit = replica_limit.try_acquire_owned().map_err(|_| ProtocolError::Other("too many clipboard replication streams".into()))?;
-            let result = crate::clipboard_replication::serve_stream(&mut send, &mut recv, &service).await.map_err(ProtocolError::Other);
+            let service = replica_service.ok_or_else(|| {
+                ProtocolError::Other("clipboard replication is not authorized or negotiated".into())
+            })?;
+            let _permit = replica_limit.try_acquire_owned().map_err(|_| {
+                ProtocolError::Other("too many clipboard replication streams".into())
+            })?;
+            let result = crate::clipboard_replication::serve_stream(&mut send, &mut recv, &service)
+                .await
+                .map_err(ProtocolError::Other);
             let _ = send.finish();
             result
         }
@@ -573,21 +524,30 @@ where
                 "remote files are unavailable",
             ),
         )
-            .await?;
+        .await?;
         return Ok(());
     };
 
-    let denied = |message: &str| {
-        RemoteFileResponse::failure(RemoteFileErrorCode::PermissionDenied, message)
-    };
+    let denied =
+        |message: &str| RemoteFileResponse::failure(RemoteFileErrorCode::PermissionDenied, message);
 
     // Reuse the bounded upload stream, but commit system-folder saves through
     // the domain service so revision checks and publication share one lock.
     let (request, expected_revision) = match request {
-        RemoteFileRequest::ConditionalUpload { share_id, relative_path, name, size, expected_revision } => (
+        RemoteFileRequest::ConditionalUpload {
+            share_id,
+            relative_path,
+            name,
+            size,
+            expected_revision,
+        } => (
             RemoteFileRequest::Upload {
-                share_id, relative_path, name, size,
-                overwrite: !expected_revision.is_empty(), expected_modified_at_ms: None,
+                share_id,
+                relative_path,
+                name,
+                size,
+                overwrite: !expected_revision.is_empty(),
+                expected_modified_at_ms: None,
             },
             Some(expected_revision),
         ),
@@ -596,45 +556,91 @@ where
 
     match request {
         RemoteFileRequest::ConditionalUpload { .. } => unreachable!("normalized above"),
-        RemoteFileRequest::Stat { share_id, relative_path } => {
+        RemoteFileRequest::Stat {
+            share_id,
+            relative_path,
+        } => {
             let response = if !access.can_read(&share_id) {
                 denied("read access to this share is not permitted")
             } else {
                 match provider.stat(&share_id, &relative_path).await {
-                    Ok((entry, revision)) => RemoteFileResponse { entry: Some(entry), revision, ..RemoteFileResponse::success() },
+                    Ok((entry, revision)) => RemoteFileResponse {
+                        entry: Some(entry),
+                        revision,
+                        ..RemoteFileResponse::success()
+                    },
                     Err(error) => RemoteFileResponse::from_error(error),
                 }
             };
             write_remote_message(send, &response).await?;
         }
-        RemoteFileRequest::ConditionalDelete { share_id, relative_path, expected_revision, recursive } => {
+        RemoteFileRequest::ConditionalDelete {
+            share_id,
+            relative_path,
+            expected_revision,
+            recursive,
+        } => {
             let response = if !access.can_write(&share_id) {
                 denied("write access to this share is not permitted")
             } else {
-                match provider.conditional_delete(&share_id, &relative_path, &expected_revision, recursive).await {
+                match provider
+                    .conditional_delete(&share_id, &relative_path, &expected_revision, recursive)
+                    .await
+                {
                     Ok(()) => RemoteFileResponse::success(),
                     Err(error) => RemoteFileResponse::from_error(error),
                 }
             };
             write_remote_message(send, &response).await?;
         }
-        RemoteFileRequest::Move { share_id, relative_path, destination_path, overwrite, expected_revision } => {
+        RemoteFileRequest::Move {
+            share_id,
+            relative_path,
+            destination_path,
+            overwrite,
+            expected_revision,
+        } => {
             let response = if !access.can_write(&share_id) {
                 denied("write access to this share is not permitted")
             } else {
-                match provider.move_entry(&share_id, &relative_path, &destination_path, overwrite, &expected_revision).await {
-                    Ok(entry) => RemoteFileResponse { entry: Some(entry), ..RemoteFileResponse::success() },
+                match provider
+                    .move_entry(
+                        &share_id,
+                        &relative_path,
+                        &destination_path,
+                        overwrite,
+                        &expected_revision,
+                    )
+                    .await
+                {
+                    Ok(entry) => RemoteFileResponse {
+                        entry: Some(entry),
+                        ..RemoteFileResponse::success()
+                    },
                     Err(error) => RemoteFileResponse::from_error(error),
                 }
             };
             write_remote_message(send, &response).await?;
         }
-        RemoteFileRequest::ReadRange { share_id, relative_path, offset, length, revision } => {
+        RemoteFileRequest::ReadRange {
+            share_id,
+            relative_path,
+            offset,
+            length,
+            revision,
+        } => {
             let response = if !access.can_read(&share_id) {
                 denied("read access to this share is not permitted")
             } else {
-                match provider.read_range(&share_id, &relative_path, offset, length, &revision).await {
-                    Ok(range_data) => RemoteFileResponse { range_data, revision, ..RemoteFileResponse::success() },
+                match provider
+                    .read_range(&share_id, &relative_path, offset, length, &revision)
+                    .await
+                {
+                    Ok(range_data) => RemoteFileResponse {
+                        range_data,
+                        revision,
+                        ..RemoteFileResponse::success()
+                    },
                     Err(error) => RemoteFileResponse::from_error(error),
                 }
             };
@@ -642,8 +648,7 @@ where
         }
         RemoteFileRequest::ListShares => {
             if !access.can_list_shares() {
-                write_remote_message(send, &denied("remote file access is not permitted"))
-                    .await?;
+                write_remote_message(send, &denied("remote file access is not permitted")).await?;
                 return Ok(());
             }
             let response = match provider.list_shares().await {
@@ -661,8 +666,7 @@ where
                 },
                 Err(error) => RemoteFileResponse::from_error(error),
             };
-            write_remote_message(send, &response)
-                .await?;
+            write_remote_message(send, &response).await?;
         }
         RemoteFileRequest::ListDirectory {
             share_id,
@@ -702,8 +706,7 @@ where
                 },
                 Err(error) => RemoteFileResponse::from_error(error),
             };
-            write_remote_message(send, &response)
-                .await?;
+            write_remote_message(send, &response).await?;
         }
         RemoteFileRequest::CreateDirectory {
             share_id,
@@ -725,8 +728,7 @@ where
                 },
                 Err(error) => RemoteFileResponse::from_error(error),
             };
-            write_remote_message(send, &response)
-                .await?;
+            write_remote_message(send, &response).await?;
         }
         RemoteFileRequest::Rename {
             share_id,
@@ -745,8 +747,7 @@ where
                 },
                 Err(error) => RemoteFileResponse::from_error(error),
             };
-            write_remote_message(send, &response)
-                .await?;
+            write_remote_message(send, &response).await?;
         }
         RemoteFileRequest::Delete {
             share_id,
@@ -761,8 +762,7 @@ where
                 Ok(()) => RemoteFileResponse::success(),
                 Err(error) => RemoteFileResponse::from_error(error),
             };
-            write_remote_message(send, &response)
-                .await?;
+            write_remote_message(send, &response).await?;
         }
         RemoteFileRequest::Download {
             share_id,
@@ -776,8 +776,7 @@ where
             let download = match provider.prepare_download(&share_id, &relative_path).await {
                 Ok(download) => download,
                 Err(error) => {
-                    write_remote_message(send, &RemoteFileResponse::from_error(error))
-                        .await?;
+                    write_remote_message(send, &RemoteFileResponse::from_error(error)).await?;
                     return Ok(());
                 }
             };
@@ -789,7 +788,7 @@ where
                         "only files can be downloaded",
                     ),
                 )
-                    .await?;
+                .await?;
                 return Ok(());
             }
             let mut file = match tokio::fs::File::open(&download.path).await {
@@ -802,7 +801,7 @@ where
                             format!("failed to open remote file: {error}"),
                         ),
                     )
-                        .await?;
+                    .await?;
                     return Ok(());
                 }
             };
@@ -816,7 +815,9 @@ where
             .await?;
             let sent = tokio::io::copy(&mut file, send).await?;
             if sent != download.entry.size {
-                return Err(ProtocolError::Other("remote file changed during download".into()));
+                return Err(ProtocolError::Other(
+                    "remote file changed during download".into(),
+                ));
             }
         }
         RemoteFileRequest::Thumbnail {
@@ -846,8 +847,7 @@ where
                     return Ok(());
                 }
                 Err(error) => {
-                    write_remote_message(send, &RemoteFileResponse::from_error(error))
-                        .await?;
+                    write_remote_message(send, &RemoteFileResponse::from_error(error)).await?;
                     return Ok(());
                 }
             };
@@ -883,7 +883,7 @@ where
                         "remote file size exceeds the limit",
                     ),
                 )
-                    .await?;
+                .await?;
                 return Ok(());
             }
             let upload = match provider
@@ -899,8 +899,7 @@ where
             {
                 Ok(upload) => upload,
                 Err(error) => {
-                    write_remote_message(send, &RemoteFileResponse::from_error(error))
-                        .await?;
+                    write_remote_message(send, &RemoteFileResponse::from_error(error)).await?;
                     return Ok(());
                 }
             };
@@ -1012,7 +1011,11 @@ where
             let response = match result {
                 Ok(()) if committed.is_some() => {
                     let (entry, revision) = committed.unwrap();
-                    RemoteFileResponse { entry: Some(entry), revision, ..RemoteFileResponse::success() }
+                    RemoteFileResponse {
+                        entry: Some(entry),
+                        revision,
+                        ..RemoteFileResponse::success()
+                    }
                 }
                 Ok(()) => RemoteFileResponse {
                     entry: Some(upload.entry),
@@ -1020,8 +1023,7 @@ where
                 },
                 Err(error) => RemoteFileResponse::from_error(error),
             };
-            write_remote_message(send, &response)
-                .await?;
+            write_remote_message(send, &response).await?;
         }
     }
     Ok(())
@@ -1033,8 +1035,7 @@ async fn handle_clipboard_blob_upload(
     uploads: ClipboardUploadStore,
 ) -> Result<()> {
     const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
-    let open: proto::ClipboardBlobUploadOpen =
-        recv_message(recv, MAX_CONTROL_FRAME_SIZE).await?;
+    let open: proto::ClipboardBlobUploadOpen = recv_message(recv, MAX_CONTROL_FRAME_SIZE).await?;
     let expected_size = usize::try_from(open.size).unwrap_or(usize::MAX);
     if open.upload_id.len() != 32
         || open.sha256.len() != 32

@@ -1,4 +1,16 @@
-#[allow(clippy::too_many_arguments)]
+#[derive(Default)]
+struct ConnectionSubscriptions {
+    system_sub: Option<StateSubscription<SystemVersioned>>,
+    media_sub: Option<StateSubscription<MediaVersioned>>,
+    window_sub: Option<StateSubscription<WindowVersioned>>,
+    clipboard_sub: Option<StateSubscription<ClipboardVersioned>>,
+    action_catalog_sub: Option<PassiveSubscription>,
+    action_output_sub: Option<EventSubscription<OutputLine>>,
+    notification_sub: Option<EventSubscription<()>>,
+    clipboard_sync_sub:
+        Option<EventSubscription<arcrelay_core::domain::clipboard::ClipboardSyncRecord>>,
+}
+
 async fn handle_subscribe(
     request: proto::SubscribeRequest,
     coordinator: &Arc<StateCoordinator>,
@@ -6,34 +18,28 @@ async fn handle_subscribe(
     features: &HashSet<i32>,
     capabilities: &HashSet<CapabilityId>,
     critical_tx: &mpsc::Sender<proto::ServerControlFrame>,
-    system_sub: &mut Option<StateSubscription<SystemVersioned>>,
-    media_sub: &mut Option<StateSubscription<MediaVersioned>>,
-    window_sub: &mut Option<StateSubscription<WindowVersioned>>,
-    clipboard_sub: &mut Option<StateSubscription<ClipboardVersioned>>,
-    action_catalog_sub: &mut Option<PassiveSubscription>,
-    action_output_sub: &mut Option<EventSubscription<OutputLine>>,
-    notification_sub: &mut Option<EventSubscription<()>>,
-    clipboard_sync_sub: &mut Option<EventSubscription<arcrelay_core::domain::clipboard::ClipboardSyncRecord>>,
+    subscriptions: &mut ConnectionSubscriptions,
 ) -> Result<()> {
+    let ConnectionSubscriptions {
+        system_sub,
+        media_sub,
+        window_sub,
+        clipboard_sub,
+        action_catalog_sub,
+        action_output_sub,
+        notification_sub,
+        clipboard_sync_sub,
+    } = subscriptions;
     let topic = proto::SubscriptionTopic::try_from(request.topic)
         .unwrap_or(proto::SubscriptionTopic::Unspecified);
     let (feature, required) = match topic {
-        proto::SubscriptionTopic::System => {
-            (proto::Feature::System, CapabilityId::SystemRead)
+        proto::SubscriptionTopic::System => (proto::Feature::System, CapabilityId::SystemRead),
+        proto::SubscriptionTopic::Media => (proto::Feature::Media, CapabilityId::MediaRead),
+        proto::SubscriptionTopic::Windows => (proto::Feature::Windows, CapabilityId::WindowRead),
+        proto::SubscriptionTopic::Clipboard => {
+            (proto::Feature::Clipboard, CapabilityId::ClipboardRead)
         }
-        proto::SubscriptionTopic::Media => {
-            (proto::Feature::Media, CapabilityId::MediaRead)
-        }
-        proto::SubscriptionTopic::Windows => {
-            (proto::Feature::Windows, CapabilityId::WindowRead)
-        }
-        proto::SubscriptionTopic::Clipboard => (
-            proto::Feature::Clipboard,
-            CapabilityId::ClipboardRead,
-        ),
-        proto::SubscriptionTopic::Actions => {
-            (proto::Feature::Actions, CapabilityId::ActionRead)
-        }
+        proto::SubscriptionTopic::Actions => (proto::Feature::Actions, CapabilityId::ActionRead),
         proto::SubscriptionTopic::ActionOutput => {
             (proto::Feature::Actions, CapabilityId::ActionRead)
         }
@@ -41,10 +47,9 @@ async fn handle_subscribe(
             proto::Feature::Notifications,
             CapabilityId::NotificationRead,
         ),
-        proto::SubscriptionTopic::ClipboardSync => (
-            proto::Feature::ClipboardSync,
-            CapabilityId::ClipboardSync,
-        ),
+        proto::SubscriptionTopic::ClipboardSync => {
+            (proto::Feature::ClipboardSync, CapabilityId::ClipboardSync)
+        }
         proto::SubscriptionTopic::Unspecified => {
             send_subscription_result(
                 critical_tx,
@@ -255,26 +260,22 @@ async fn handle_subscribe(
     .await?;
 
     let initial = match topic {
-        proto::SubscriptionTopic::System => {
-            coordinator.latest_system().await.map(|value| {
-                event_frame(
-                    subscription_id,
-                    1,
-                    value.captured_at_ms,
-                    proto::event::Data::System(build_system_snapshot(value.data.clone())),
-                )
-            })
-        }
-        proto::SubscriptionTopic::Media => {
-            coordinator.latest_media().await.map(|value| {
-                event_frame(
-                    subscription_id,
-                    1,
-                    value.captured_at_ms,
-                    proto::event::Data::Media(build_media_snapshot(&value.data)),
-                )
-            })
-        }
+        proto::SubscriptionTopic::System => coordinator.latest_system().await.map(|value| {
+            event_frame(
+                subscription_id,
+                1,
+                value.captured_at_ms,
+                proto::event::Data::System(build_system_snapshot(value.data.clone())),
+            )
+        }),
+        proto::SubscriptionTopic::Media => coordinator.latest_media().await.map(|value| {
+            event_frame(
+                subscription_id,
+                1,
+                value.captured_at_ms,
+                proto::event::Data::Media(build_media_snapshot(&value.data)),
+            )
+        }),
         proto::SubscriptionTopic::Windows => {
             let spaces = current_spaces(coordinator).await;
             coordinator.latest_windows().await.map(|value| {
@@ -289,7 +290,8 @@ async fn handle_subscribe(
                 )
             })
         }
-        proto::SubscriptionTopic::Clipboard => coordinator.latest_clipboard().await.and_then(|value| {
+        proto::SubscriptionTopic::Clipboard => {
+            coordinator.latest_clipboard().await.and_then(|value| {
                 let snapshot = match build_clipboard_snapshot(
                     value.data.history.clone(),
                     value.data.policy.clone(),
@@ -303,7 +305,8 @@ async fn handle_subscribe(
                     }
                 };
                 clipboard_event_frame(subscription_id, 1, value.captured_at_ms, snapshot)
-            }),
+            })
+        }
         proto::SubscriptionTopic::Actions => Some(event_frame(
             subscription_id,
             1,
@@ -376,19 +379,21 @@ async fn send_subscription_result(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_unsubscribe(
     request: proto::UnsubscribeRequest,
     critical_tx: &mpsc::Sender<proto::ServerControlFrame>,
-    system_sub: &mut Option<StateSubscription<SystemVersioned>>,
-    media_sub: &mut Option<StateSubscription<MediaVersioned>>,
-    window_sub: &mut Option<StateSubscription<WindowVersioned>>,
-    clipboard_sub: &mut Option<StateSubscription<ClipboardVersioned>>,
-    action_catalog_sub: &mut Option<PassiveSubscription>,
-    action_output_sub: &mut Option<EventSubscription<OutputLine>>,
-    notification_sub: &mut Option<EventSubscription<()>>,
-    clipboard_sync_sub: &mut Option<EventSubscription<arcrelay_core::domain::clipboard::ClipboardSyncRecord>>,
+    subscriptions: &mut ConnectionSubscriptions,
 ) -> Result<()> {
+    let ConnectionSubscriptions {
+        system_sub,
+        media_sub,
+        window_sub,
+        clipboard_sub,
+        action_catalog_sub,
+        action_output_sub,
+        notification_sub,
+        clipboard_sync_sub,
+    } = subscriptions;
     if request.subscription_id == 0 {
         return send_subscription_result(
             critical_tx,
@@ -832,7 +837,10 @@ async fn recv_notification_change(sub: &mut Option<EventSubscription<()>>) -> Op
         Some(sub) => match sub.receiver.recv().await {
             Ok(()) => Some(()),
             Err(broadcast::error::RecvError::Lagged(count)) => {
-                warn!(count, "notification subscription lagged; sending latest snapshot");
+                warn!(
+                    count,
+                    "notification subscription lagged; sending latest snapshot"
+                );
                 Some(())
             }
             Err(_) => None,
@@ -842,15 +850,16 @@ async fn recv_notification_change(sub: &mut Option<EventSubscription<()>>) -> Op
 }
 
 async fn recv_clipboard_sync(
-    sub: &mut Option<
-        EventSubscription<arcrelay_core::domain::clipboard::ClipboardSyncRecord>,
-    >,
+    sub: &mut Option<EventSubscription<arcrelay_core::domain::clipboard::ClipboardSyncRecord>>,
 ) -> Option<arcrelay_core::domain::clipboard::ClipboardSyncRecord> {
     match sub.as_mut() {
         Some(sub) => match sub.receiver.recv().await {
             Ok(record) => Some(record),
             Err(broadcast::error::RecvError::Lagged(count)) => {
-                warn!(count, "clipboard sync subscription lagged; merge is required");
+                warn!(
+                    count,
+                    "clipboard sync subscription lagged; merge is required"
+                );
                 None
             }
             Err(_) => None,

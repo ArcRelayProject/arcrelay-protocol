@@ -45,7 +45,11 @@ fn feature(feature: proto::Feature) -> proto::FeatureVersion {
     proto::FeatureVersion {
         feature: feature as i32,
         min_version: version,
-        max_version: if feature == proto::Feature::ClipboardSync { crate::clipboard_replication::VERSION } else { version },
+        max_version: if feature == proto::Feature::ClipboardSync {
+            crate::clipboard_replication::VERSION
+        } else {
+            version
+        },
     }
 }
 
@@ -118,7 +122,9 @@ fn validate_receive_limits(
     features: &[proto::FeatureVersion],
 ) -> Result<()> {
     let Some(limits) = limits else {
-        return Err(ProtocolError::Other("client receive limits are required".into()));
+        return Err(ProtocolError::Other(
+            "client receive limits are required".into(),
+        ));
     };
 
     let offers = |feature: proto::Feature| {
@@ -137,10 +143,8 @@ fn validate_receive_limits(
     {
         return invalid("max_control_frame_bytes");
     }
-    if limits.max_reliable_input_frame_bytes
-        > arcrelay_wire::MAX_RELIABLE_INPUT_FRAME_SIZE as u32
-        || (offers(proto::Feature::InputReliable)
-            && limits.max_reliable_input_frame_bytes == 0)
+    if limits.max_reliable_input_frame_bytes > arcrelay_wire::MAX_RELIABLE_INPUT_FRAME_SIZE as u32
+        || (offers(proto::Feature::InputReliable) && limits.max_reliable_input_frame_bytes == 0)
     {
         return invalid("max_reliable_input_frame_bytes");
     }
@@ -167,8 +171,7 @@ fn validate_receive_limits(
     }
     if limits.max_remote_file_message_bytes
         > crate::remote_files::MAX_REMOTE_FILE_MESSAGE_SIZE as u32
-        || (offers(proto::Feature::RemoteFiles)
-            && limits.max_remote_file_message_bytes < 4096)
+        || (offers(proto::Feature::RemoteFiles) && limits.max_remote_file_message_bytes < 4096)
     {
         return invalid("max_remote_file_message_bytes");
     }
@@ -214,8 +217,6 @@ fn grant_to_proto(grant: &Grant) -> proto::GrantedCapability {
         granted_at_ms: grant.granted_at_ms,
     }
 }
-
-
 
 fn ok_status() -> proto::Status {
     proto::Status {
@@ -291,10 +292,18 @@ mod feature_negotiation_tests {
     #[test]
     fn clipboard_replication_selects_v2_without_breaking_v1_clients() {
         let modern = feature(proto::Feature::ClipboardSync);
-        let legacy = proto::FeatureVersion { feature: proto::Feature::ClipboardSync as i32, min_version: 1, max_version: 1 };
-        for (client, server, expected) in [(modern,modern,2),(legacy,modern,1),(modern,legacy,1)] {
-            let selected=negotiate_features(&[client],&[server]).unwrap();
-            assert_eq!(selected[&(proto::Feature::ClipboardSync as i32)],expected);
+        let legacy = proto::FeatureVersion {
+            feature: proto::Feature::ClipboardSync as i32,
+            min_version: 1,
+            max_version: 1,
+        };
+        for (client, server, expected) in [
+            (modern, modern, 2),
+            (legacy, modern, 1),
+            (modern, legacy, 1),
+        ] {
+            let selected = negotiate_features(&[client], &[server]).unwrap();
+            assert_eq!(selected[&(proto::Feature::ClipboardSync as i32)], expected);
         }
     }
 
@@ -365,12 +374,12 @@ async fn send_critical(
         .map_err(|_| ProtocolError::ConnectionClosed)
 }
 
-async fn handle_request(
-    request: proto::Request,
+#[derive(Clone)]
+struct RequestContext {
     coordinator: Arc<StateCoordinator>,
     action_provider: Option<Arc<dyn HostCapabilityProvider>>,
-    features: HashSet<i32>,
-    capabilities: HashSet<CapabilityId>,
+    features: Arc<HashSet<i32>>,
+    capabilities: Arc<HashSet<CapabilityId>>,
     blob_store: BlobStore,
     clipboard_uploads: ClipboardUploadStore,
     command_cache: Arc<Mutex<CommandCache>>,
@@ -378,7 +387,25 @@ async fn handle_request(
     device_public_key: Vec<u8>,
     device_id: String,
     device_name: String,
+}
+
+async fn handle_request(
+    request: proto::Request,
+    context: RequestContext,
 ) -> proto::ServerControlFrame {
+    let RequestContext {
+        coordinator,
+        action_provider,
+        features,
+        capabilities,
+        blob_store,
+        clipboard_uploads,
+        command_cache,
+        command_limit,
+        device_public_key,
+        device_id,
+        device_name,
+    } = context;
     let request_id = request.request_id;
     let idempotency_key = request.idempotency_key;
     match request.body {
@@ -391,7 +418,7 @@ async fn handle_request(
                 );
             }
             if let Err(frame) = authorize_query(request_id, &query, &features, &capabilities) {
-                return frame;
+                return frame.into_frame();
             }
             handle_query(
                 request_id,
@@ -415,7 +442,7 @@ async fn handle_request(
                 );
             }
             if let Err(frame) = authorize_command(request_id, &command, &features, &capabilities) {
-                return frame;
+                return frame.into_frame();
             }
             let encoded_command = command.encode_to_vec();
             let cache_key = CommandCacheKey::new(&device_public_key, &idempotency_key);
@@ -423,7 +450,8 @@ async fn handle_request(
                 let mut cache = command_cache.lock().await;
                 cache.prune();
                 match cached_command_frame(&cache, &cache_key, &encoded_command, request_id) {
-                    Ok(Some(frame)) | Err(frame) => return frame,
+                    Ok(Some(frame)) => return frame,
+                    Err(error) => return error.into_frame(),
                     Ok(None) => {}
                 }
             }
@@ -435,7 +463,8 @@ async fn handle_request(
                 let mut cache = command_cache.lock().await;
                 cache.prune();
                 match cached_command_frame(&cache, &cache_key, &encoded_command, request_id) {
-                    Ok(Some(frame)) | Err(frame) => return frame,
+                    Ok(Some(frame)) => return frame,
+                    Err(error) => return error.into_frame(),
                     Ok(None) => {}
                 }
                 if let Some(in_flight) = cache.in_flight.get(&cache_key) {
@@ -546,16 +575,14 @@ async fn handle_request(
                 );
             }
             if let Err(frame) = require_feature(request_id, &features, proto::Feature::Blobs) {
-                return frame;
+                return frame.into_frame();
             }
-            if let Err(frame) =
-                require_any_capability(
-                    request_id,
-                    &capabilities,
-                    &[CapabilityId::ClipboardRead, CapabilityId::ClipboardSync],
-                )
-            {
-                return frame;
+            if let Err(frame) = require_any_capability(
+                request_id,
+                &capabilities,
+                &[CapabilityId::ClipboardRead, CapabilityId::ClipboardSync],
+            ) {
+                return frame.into_frame();
             }
             match blob_store.issue_ticket(&device_public_key, &request.blob_id) {
                 Ok(ticket) => server_frame(proto::server_control_frame::Body::Response(
@@ -585,17 +612,35 @@ async fn handle_request(
     }
 }
 
+struct RequestRejection {
+    request_id: u64,
+    code: proto::ErrorCode,
+    message: String,
+}
+impl RequestRejection {
+    fn new(request_id: u64, code: proto::ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            code,
+            message: message.into(),
+        }
+    }
+    fn into_frame(self) -> proto::ServerControlFrame {
+        response_error(self.request_id, self.code, self.message)
+    }
+}
+
 fn cached_command_frame(
     cache: &CommandCache,
     cache_key: &CommandCacheKey,
     encoded_command: &[u8],
     request_id: u64,
-) -> std::result::Result<Option<proto::ServerControlFrame>, proto::ServerControlFrame> {
+) -> std::result::Result<Option<proto::ServerControlFrame>, RequestRejection> {
     let Some(cached) = cache.entries.get(cache_key) else {
         return Ok(None);
     };
     if cached.command != encoded_command {
-        return Err(response_error(
+        return Err(RequestRejection::new(
             request_id,
             proto::ErrorCode::InvalidArgument,
             "idempotency key was reused for a different command",
@@ -620,9 +665,9 @@ fn authorize_query(
     query: &proto::Query,
     features: &HashSet<i32>,
     capabilities: &HashSet<CapabilityId>,
-) -> std::result::Result<(), proto::ServerControlFrame> {
+) -> std::result::Result<(), RequestRejection> {
     if let Err(message) = validate_query(query) {
-        return Err(response_error(
+        return Err(RequestRejection::new(
             request_id,
             proto::ErrorCode::InvalidArgument,
             message,
@@ -632,17 +677,13 @@ fn authorize_query(
         Some(proto::query::Body::GetSystem(_)) => {
             (proto::Feature::System, CapabilityId::SystemRead)
         }
-        Some(proto::query::Body::ListProcesses(_)) => (
-            proto::Feature::Processes,
-            CapabilityId::ProcessRead,
-        ),
-        Some(proto::query::Body::GetMedia(_)) => {
-            (proto::Feature::Media, CapabilityId::MediaRead)
+        Some(proto::query::Body::ListProcesses(_)) => {
+            (proto::Feature::Processes, CapabilityId::ProcessRead)
         }
-        Some(proto::query::Body::GetClipboard(_)) => (
-            proto::Feature::Clipboard,
-            CapabilityId::ClipboardRead,
-        ),
+        Some(proto::query::Body::GetMedia(_)) => (proto::Feature::Media, CapabilityId::MediaRead),
+        Some(proto::query::Body::GetClipboard(_)) => {
+            (proto::Feature::Clipboard, CapabilityId::ClipboardRead)
+        }
         Some(proto::query::Body::GetDevices(_)) => {
             (proto::Feature::System, CapabilityId::SystemRead)
         }
@@ -656,12 +697,11 @@ fn authorize_query(
             proto::Feature::Notifications,
             CapabilityId::NotificationRead,
         ),
-        Some(proto::query::Body::GetClipboardSync(_)) => (
-            proto::Feature::ClipboardSync,
-            CapabilityId::ClipboardSync,
-        ),
+        Some(proto::query::Body::GetClipboardSync(_)) => {
+            (proto::Feature::ClipboardSync, CapabilityId::ClipboardSync)
+        }
         None => {
-            return Err(response_error(
+            return Err(RequestRejection::new(
                 request_id,
                 proto::ErrorCode::InvalidArgument,
                 "empty query",
@@ -733,9 +773,12 @@ fn authorize_command(
     command: &proto::Command,
     features: &HashSet<i32>,
     capabilities: &HashSet<CapabilityId>,
-) -> std::result::Result<(), proto::ServerControlFrame> {
+) -> std::result::Result<(), RequestRejection> {
     if let Err(message) = validate_command(command) {
-        if matches!(command.action, Some(proto::command::Action::ApplyClipboardSyncRecord(_))) {
+        if matches!(
+            command.action,
+            Some(proto::command::Action::ApplyClipboardSyncRecord(_))
+        ) {
             tracing::warn!(
                 event = "clipboard.sync.record_validation_failed",
                 request_id,
@@ -743,7 +786,7 @@ fn authorize_command(
                 "rejected invalid clipboard sync record"
             );
         }
-        return Err(response_error(
+        return Err(RequestRejection::new(
             request_id,
             proto::ErrorCode::InvalidArgument,
             message,
@@ -766,10 +809,9 @@ fn authorize_command(
         | Some(proto::command::Action::SetDnd(_)) => {
             (proto::Feature::Media, CapabilityId::MediaControl)
         }
-        Some(proto::command::Action::KillProcess(_)) => (
-            proto::Feature::Processes,
-            CapabilityId::ProcessManage,
-        ),
+        Some(proto::command::Action::KillProcess(_)) => {
+            (proto::Feature::Processes, CapabilityId::ProcessManage)
+        }
         Some(proto::command::Action::SetClipboard(_))
         | Some(proto::command::Action::ClearClipboardHistory(_))
         | Some(proto::command::Action::PasteClipboardRecord(_))
@@ -779,33 +821,28 @@ fn authorize_command(
         | Some(proto::command::Action::UpdateClipboardLabel(_))
         | Some(proto::command::Action::DeleteClipboardLabel(_))
         | Some(proto::command::Action::SetClipboardLabels(_))
-        | Some(proto::command::Action::UpdateClipboardPolicy(_)) => (
-            proto::Feature::Clipboard,
-            CapabilityId::ClipboardWrite,
-        ),
+        | Some(proto::command::Action::UpdateClipboardPolicy(_)) => {
+            (proto::Feature::Clipboard, CapabilityId::ClipboardWrite)
+        }
         Some(proto::command::Action::FocusWindow(_))
-        | Some(proto::command::Action::SwitchSpace(_)) => (
-            proto::Feature::Windows,
-            CapabilityId::WindowControl,
-        ),
+        | Some(proto::command::Action::SwitchSpace(_)) => {
+            (proto::Feature::Windows, CapabilityId::WindowControl)
+        }
         Some(proto::command::Action::ExecuteQuickAction(_))
         | Some(proto::command::Action::RunAutomation(_))
         | Some(proto::command::Action::SetAutomationEnabled(_))
-        | Some(proto::command::Action::CancelAutomation(_))
-        => (
-            proto::Feature::Actions,
-            CapabilityId::ActionExecute,
-        ),
+        | Some(proto::command::Action::CancelAutomation(_)) => {
+            (proto::Feature::Actions, CapabilityId::ActionExecute)
+        }
         Some(proto::command::Action::MarkNotificationRead(_)) => (
             proto::Feature::Notifications,
             CapabilityId::NotificationAcknowledge,
         ),
-        Some(proto::command::Action::ApplyClipboardSyncRecord(_)) => (
-            proto::Feature::ClipboardSync,
-            CapabilityId::ClipboardSync,
-        ),
+        Some(proto::command::Action::ApplyClipboardSyncRecord(_)) => {
+            (proto::Feature::ClipboardSync, CapabilityId::ClipboardSync)
+        }
         None => {
-            return Err(response_error(
+            return Err(RequestRejection::new(
                 request_id,
                 proto::ErrorCode::InvalidArgument,
                 "empty command",
@@ -898,13 +935,19 @@ fn validate_command(command: &proto::Command) -> std::result::Result<(), &'stati
             }
         }
         Some(proto::command::Action::RunAutomation(command)) => {
-            if !valid_control_identifier(&command.automation_id) { return Err("invalid automation id"); }
+            if !valid_control_identifier(&command.automation_id) {
+                return Err("invalid automation id");
+            }
         }
         Some(proto::command::Action::SetAutomationEnabled(command)) => {
-            if !valid_control_identifier(&command.automation_id) { return Err("invalid automation id"); }
+            if !valid_control_identifier(&command.automation_id) {
+                return Err("invalid automation id");
+            }
         }
         Some(proto::command::Action::CancelAutomation(command)) => {
-            if !valid_control_identifier(&command.activity_id) { return Err("invalid automation activity id"); }
+            if !valid_control_identifier(&command.activity_id) {
+                return Err("invalid automation activity id");
+            }
         }
         Some(proto::command::Action::MarkNotificationRead(command)) => {
             if !valid_control_identifier(&command.notification_id) {
@@ -961,7 +1004,8 @@ fn validate_clipboard_sync_record(
     if record.revision == 0 || record.revision > i64::MAX as u64 {
         return Err("invalid clipboard sync revision");
     }
-    if record.captured_at_ms <= 0 || record.captured_at_ms > now_ms().saturating_add(5 * 60 * 1000) {
+    if record.captured_at_ms <= 0 || record.captured_at_ms > now_ms().saturating_add(5 * 60 * 1000)
+    {
         return Err("invalid clipboard sync capture timestamp");
     }
     let kind = proto::ClipboardContentKind::try_from(record.kind)
@@ -987,7 +1031,8 @@ fn validate_clipboard_sync_record(
     }
     match kind {
         proto::ClipboardContentKind::Text => {
-            if !matches!(record.payload.as_ref(), Some(Payload::Text(text)) if !text.is_empty() && text.len() <= 768 * 1024) {
+            if !matches!(record.payload.as_ref(), Some(Payload::Text(text)) if !text.is_empty() && text.len() <= 768 * 1024)
+            {
                 return Err("invalid synchronized text payload");
             }
         }
@@ -996,8 +1041,14 @@ fn validate_clipboard_sync_record(
                 return Err("synchronized rich text is required");
             };
             if rich_text.plain_text.len() > 1024 * 1024
-                || !valid_clipboard_blob_ref(rich_text.html.as_ref(), "text/html; charset=utf-8", 16 * 1024 * 1024)
-                || rich_text.rtf.as_ref().is_some_and(|rtf| !valid_clipboard_blob_ref(Some(rtf), "text/rtf", 16 * 1024 * 1024))
+                || !valid_clipboard_blob_ref(
+                    rich_text.html.as_ref(),
+                    "text/html; charset=utf-8",
+                    16 * 1024 * 1024,
+                )
+                || rich_text.rtf.as_ref().is_some_and(|rtf| {
+                    !valid_clipboard_blob_ref(Some(rtf), "text/rtf", 16 * 1024 * 1024)
+                })
             {
                 return Err("invalid synchronized rich-text payload");
             }
@@ -1020,7 +1071,11 @@ fn validate_clipboard_sync_record(
     Ok(())
 }
 
-fn valid_clipboard_blob_ref(reference: Option<&proto::BlobRef>, media_type: &str, maximum: u64) -> bool {
+fn valid_clipboard_blob_ref(
+    reference: Option<&proto::BlobRef>,
+    media_type: &str,
+    maximum: u64,
+) -> bool {
     reference.is_some_and(|reference| {
         reference.blob_id.len() == 32
             && reference.sha256.len() == 32
@@ -1035,11 +1090,11 @@ fn require_feature(
     request_id: u64,
     features: &HashSet<i32>,
     feature: proto::Feature,
-) -> std::result::Result<(), proto::ServerControlFrame> {
+) -> std::result::Result<(), RequestRejection> {
     if features.contains(&(feature as i32)) {
         Ok(())
     } else {
-        Err(response_error(
+        Err(RequestRejection::new(
             request_id,
             proto::ErrorCode::Unsupported,
             format!("feature {:?} was not negotiated", feature),
@@ -1051,11 +1106,11 @@ fn require_capability(
     request_id: u64,
     capabilities: &HashSet<CapabilityId>,
     capability: CapabilityId,
-) -> std::result::Result<(), proto::ServerControlFrame> {
+) -> std::result::Result<(), RequestRejection> {
     if capabilities.contains(&capability) {
         Ok(())
     } else {
-        Err(response_error(
+        Err(RequestRejection::new(
             request_id,
             proto::ErrorCode::PermissionDenied,
             format!("capability {} was not granted", capability.token()),
@@ -1067,11 +1122,14 @@ fn require_any_capability(
     request_id: u64,
     capabilities: &HashSet<CapabilityId>,
     required: &[CapabilityId],
-) -> std::result::Result<(), proto::ServerControlFrame> {
-    if required.iter().any(|capability| capabilities.contains(capability)) {
+) -> std::result::Result<(), RequestRejection> {
+    if required
+        .iter()
+        .any(|capability| capabilities.contains(capability))
+    {
         Ok(())
     } else {
-        Err(response_error(
+        Err(RequestRejection::new(
             request_id,
             proto::ErrorCode::PermissionDenied,
             "required capability was not granted",

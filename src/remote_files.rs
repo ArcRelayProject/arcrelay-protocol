@@ -682,6 +682,8 @@ pub trait RemoteFileProvider: Send + Sync {
 
     async fn list_shares(&self) -> RemoteFileResult<Vec<RemoteFileShare>>;
 
+    // Keep the established provider ABI stable across standalone feature adapters.
+    #[allow(clippy::too_many_arguments)]
     async fn list_directory(
         &self,
         share_id: &str,

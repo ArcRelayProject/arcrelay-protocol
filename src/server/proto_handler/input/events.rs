@@ -51,7 +51,9 @@ pub(super) fn convert_reliable_events(
             }
             Some(proto::reliable_input_event::Event::ReleaseAll(_)) => DomainInputEvent::ReleaseAll,
             Some(proto::reliable_input_event::Event::SystemGesture(gesture)) => {
-                use arcrelay_core::domain::input_control::{SystemGestureEvent, SYSTEM_GESTURE_FORMAT_VERSION};
+                use arcrelay_core::domain::input_control::{
+                    SystemGestureEvent, SYSTEM_GESTURE_FORMAT_VERSION,
+                };
                 if gesture.format_version != SYSTEM_GESTURE_FORMAT_VERSION {
                     return Err("unsupported system gesture format".into());
                 }
@@ -64,7 +66,9 @@ pub(super) fn convert_reliable_events(
                     // The mobile control-session protocol remains DockSwipe v1.
                     inverted_from_device: false,
                     finger_count: 0,
-                }.validate_format(gesture.format_version).map_err(str::to_string)?;
+                }
+                .validate_format(gesture.format_version)
+                .map_err(str::to_string)?;
                 DomainInputEvent::SystemGesture(gesture)
             }
             Some(proto::reliable_input_event::Event::ScrollGesture(gesture)) => {
@@ -133,9 +137,7 @@ pub(super) fn input_focus_changed_frame(
         WorkspaceInputFocusCause::DesktopPortal => proto::InputFocusCause::DesktopPortal,
         WorkspaceInputFocusCause::PhysicalActivity => proto::InputFocusCause::PhysicalActivity,
         WorkspaceInputFocusCause::SessionEnded => proto::InputFocusCause::SessionEnded,
-        WorkspaceInputFocusCause::GatewayUnavailable => {
-            proto::InputFocusCause::GatewayUnavailable
-        }
+        WorkspaceInputFocusCause::GatewayUnavailable => proto::InputFocusCause::GatewayUnavailable,
     };
     server_frame(proto::server_control_frame::Body::InputFocusChanged(
         proto::InputFocusChanged {
@@ -153,30 +155,13 @@ pub(super) fn input_focus_changed_frame(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn revoke_input_with_feedback(
+async fn revoke_input_with_feedback(
     lease: InputLease,
     message: &str,
-    active_input: &Arc<Mutex<Option<InputLease>>>,
-    input_sessions: &InputSessionManager,
-    coordinator: &StateCoordinator,
+    context: &InputSessionContext,
     critical_tx: &mpsc::Sender<proto::ServerControlFrame>,
-    event_tx: &mpsc::Sender<ServerEvent>,
-    device_id: &str,
-    device_name: &str,
-    workspace_input_router: Option<&Arc<dyn WorkspaceInputRouter>>,
 ) {
-    end_input_lease_locked(
-        lease,
-        active_input,
-        input_sessions,
-        coordinator,
-        event_tx,
-        device_id,
-        device_name,
-        workspace_input_router,
-    )
-    .await;
+    end_input_lease_locked(lease, context).await;
     let _ = send_critical(
         critical_tx,
         input_feedback_frame(
@@ -188,35 +173,35 @@ pub(super) async fn revoke_input_with_feedback(
     .await;
 }
 
-pub(super) async fn end_input_lease_locked(
-    lease: InputLease,
-    active_input: &Arc<Mutex<Option<InputLease>>>,
-    input_sessions: &InputSessionManager,
-    coordinator: &StateCoordinator,
-    event_tx: &mpsc::Sender<ServerEvent>,
-    device_id: &str,
-    device_name: &str,
-    workspace_input_router: Option<&Arc<dyn WorkspaceInputRouter>>,
-) {
+async fn end_input_lease_locked(lease: InputLease, context: &InputSessionContext) {
+    let InputSessionContext {
+        coordinator,
+        input_sessions,
+        active_input,
+        event_tx,
+        device_id,
+        device_name,
+        workspace_input_router,
+        ..
+    } = context;
     let mut active = active_input.lock().await;
     if active.as_ref().is_some_and(|current| *current == lease) {
-        *active = None;
-        drop(active);
         let workspace_routed = input_sessions.is_workspace_routed(lease, device_id).await;
-        let release_events = input_sessions.release(lease).await;
+        // Input ownership is exclusive. Keep the lease reserved until native
+        // release finishes, so cancellation can safely retry cleanup and a new
+        // controller cannot acquire the device halfway through key release.
         if workspace_routed {
             if let Some(router) = workspace_input_router {
                 router
                     .end(device_id, WorkspaceInputFocusCause::SessionEnded)
                     .await;
             }
-        } else if !release_events.is_empty() {
-            let _ = coordinator
-                .service()
-                .input_control
-                .apply_events(&release_events)
-                .await;
+        } else {
+            let _ = coordinator.service().input_control.release_all().await;
         }
+        let _ = input_sessions.release(lease).await;
+        *active = None;
+        drop(active);
         emit_input_ended(event_tx, lease, device_id, device_name).await;
     }
 }
@@ -227,13 +212,15 @@ pub(super) async fn emit_input_ended(
     device_id: &str,
     device_name: &str,
 ) {
-    let _ = event_tx
-        .send(ServerEvent::InputSessionEnded {
+    let _ = tokio::time::timeout(
+        CRITICAL_SEND_TIMEOUT,
+        event_tx.send(ServerEvent::InputSessionEnded {
             session_id: lease_label(lease),
             device_id: device_id.to_string(),
             device_name: device_name.to_string(),
-        })
-        .await;
+        }),
+    )
+    .await;
 }
 
 pub(super) fn lease_label(lease: InputLease) -> String {

@@ -9,20 +9,14 @@ publish = false
 default = ["host"]
 host = ["dep:arcrelay-core"]
 
-[lints.clippy]
-# These shape lints are tracked by the ongoing protocol-handler module split;
-# keep CI strict for correctness, allocation, and API-quality warnings.
-too_many_arguments = "allow"
-result_large_err = "allow"
-
 [dependencies]
 ts-rs = { version = "12", features = ["serde-json-impl", "chrono-impl", "uuid-impl", "no-serde-warnings"] }
 async-trait = "0.1"
-arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "9e81d2182f38855a9b6201ebe527c21a2a4ee9d0", optional = true }
-arcrelay-transport = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-transport.git", rev = "16305821fea3778e3fc544f0e57eb3b5b51fec11" }
+arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "d6dfc8467c5dceb7837ad1e6ff82b25f5ce68ea1", optional = true }
+arcrelay-transport = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-transport.git", rev = "968a954c753b567d51fb17aa00c3c508af80250b" }
 arcrelay-wire = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-wire.git", rev = "f27e8db31c222bc478f22fabd6c3effe09655625" }
-arcrelay-network = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-network.git", rev = "7b938e19996ceea288943012a5d5c319d780a89d" }
-arcrelay-peer = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-peer.git", rev = "739e41c49020cf19f0d490c64143e68e995aef83" }
+arcrelay-network = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-network.git", rev = "d5ca48fc20d530cceab60521137580cc3e6d1f3b" }
+arcrelay-peer = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-peer.git", rev = "48cd4ad8538a0b5add33877f7f9b295e78c4fce1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 prost = "0.13"
@@ -38,6 +32,6 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "9e81d2182f38855a9b6201ebe527c21a2a4ee9d0", features = ["test-support"] }
+arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "d6dfc8467c5dceb7837ad1e6ff82b25f5ce68ea1", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
