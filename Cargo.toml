@@ -12,7 +12,7 @@ host = ["dep:arcrelay-core"]
 [dependencies]
 ts-rs = { version = "12", features = ["serde-json-impl", "chrono-impl", "uuid-impl", "no-serde-warnings"] }
 async-trait = "0.1"
-arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "548d6ec0ba70238570d7f9c3182808c858e29c94", optional = true }
+arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "35049e43af70c73cccf5d6989a7f31ff8de1b0a0", optional = true }
 arcrelay-transport = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-transport.git", rev = "968a954c753b567d51fb17aa00c3c508af80250b" }
 arcrelay-wire = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-wire.git", rev = "f27e8db31c222bc478f22fabd6c3effe09655625" }
 arcrelay-network = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-network.git", rev = "d5ca48fc20d530cceab60521137580cc3e6d1f3b" }
@@ -32,6 +32,6 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "548d6ec0ba70238570d7f9c3182808c858e29c94", features = ["test-support"] }
+arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "35049e43af70c73cccf5d6989a7f31ff8de1b0a0", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
