@@ -154,6 +154,9 @@ impl InputControlRepository for TestHost {
     async fn paste_clipboard(&self, _is_text: bool) -> arcrelay_core::Result<()> {
         Ok(())
     }
+    async fn type_text_as_keys(&self, _text: &str) -> arcrelay_core::Result<()> {
+        Ok(())
+    }
     async fn release_all(&self) -> arcrelay_core::Result<()> {
         if self.release_blocked.load(Ordering::SeqCst) {
             self.release_started.notify_one();
