@@ -15,8 +15,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub const DEFAULT_REMOTE_DIRECTORY_PAGE_SIZE: u32 = 100;
 pub const MAX_REMOTE_DIRECTORY_PAGE_SIZE: u32 = 200;
 pub const MAX_REMOTE_RANGE_BYTES: u32 = 256 * 1024;
-/// Protocol v2 requires every failed response to carry a stable error code.
-pub const REMOTE_FILE_PROTOCOL_VERSION: u32 = 2;
+/// Protocol v3 adds resumable directory invalidations for native folders.
+pub const REMOTE_FILE_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -177,11 +177,14 @@ pub enum RemoteFileSortDirection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteFileEntry {
+    pub id: String,
     pub name: String,
     pub relative_path: String,
     pub kind: RemoteFileKind,
     pub size: u64,
     pub modified_at_ms: i64,
+    #[serde(default)]
+    pub revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
@@ -203,6 +206,11 @@ pub struct RemoteFileThumbnail {
 #[serde(tag = "operation", rename_all = "camelCase")]
 pub enum RemoteFileRequest {
     ListShares,
+    WatchChanges {
+        share_id: String,
+        epoch: String,
+        after_sequence: u64,
+    },
     Stat {
         share_id: String,
         relative_path: String,
@@ -289,6 +297,7 @@ impl RemoteFileRequest {
     pub const fn operation_name(&self) -> &'static str {
         match self {
             Self::ListShares => "list_shares",
+            Self::WatchChanges { .. } => "watch_changes",
             Self::Stat { .. } => "stat",
             Self::Move { .. } => "move",
             Self::ConditionalDelete { .. } => "conditional_delete",
@@ -307,6 +316,15 @@ impl RemoteFileRequest {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::ListShares => Ok(()),
+            Self::WatchChanges {
+                share_id, epoch, ..
+            } => {
+                validate_share_id(share_id)?;
+                if epoch.len() > 64 || epoch.chars().any(char::is_control) {
+                    return Err("invalid change epoch".into());
+                }
+                Ok(())
+            }
             Self::Stat {
                 share_id,
                 relative_path,
@@ -475,6 +493,14 @@ pub struct RemoteFileResponse {
     pub revision: String,
     #[serde(default)]
     pub range_data: Vec<u8>,
+    #[serde(default)]
+    pub change_epoch: String,
+    #[serde(default)]
+    pub change_sequence: u64,
+    #[serde(default)]
+    pub changed_directories: Vec<String>,
+    #[serde(default)]
+    pub change_reset: bool,
 }
 
 impl RemoteFileResponse {
@@ -490,6 +516,10 @@ impl RemoteFileResponse {
             thumbnail_media_type: None,
             revision: String::new(),
             range_data: Vec::new(),
+            change_epoch: String::new(),
+            change_sequence: 0,
+            changed_directories: Vec::new(),
+            change_reset: false,
         }
     }
 
@@ -513,6 +543,10 @@ impl RemoteFileResponse {
             thumbnail_media_type: None,
             revision: String::new(),
             range_data: Vec::new(),
+            change_epoch: String::new(),
+            change_sequence: 0,
+            changed_directories: Vec::new(),
+            change_reset: false,
         }
     }
 
@@ -524,6 +558,12 @@ impl RemoteFileResponse {
         if self.ok == self.error.is_some()
             || self.revision.len() > 128
             || self.range_data.len() > MAX_REMOTE_RANGE_BYTES as usize
+            || self.change_epoch.len() > 64
+            || self.changed_directories.len() > 200
+            || self
+                .changed_directories
+                .iter()
+                .any(|path| validate_relative_path(path).is_err())
             || self
                 .error
                 .as_ref()
@@ -554,6 +594,9 @@ impl RemoteFileResponse {
             validate_relative_path(&entry.relative_path)?;
             if entry.size > MAX_REMOTE_FILE_CONTENT_SIZE {
                 return Err("remote file entry exceeds the content limit".into());
+            }
+            if entry.revision.len() > 128 {
+                return Err("invalid remote file revision".into());
             }
         }
         Ok(())
@@ -614,6 +657,18 @@ pub struct RemoteFileUpload {
 
 #[async_trait]
 pub trait RemoteFileProvider: Send + Sync {
+    async fn watch_changes(
+        &self,
+        _share_id: &str,
+        _epoch: &str,
+        _after_sequence: u64,
+    ) -> RemoteFileResult<(String, u64, Vec<String>, bool)> {
+        Err(RemoteFileError::new(
+            RemoteFileErrorCode::FailedPrecondition,
+            "this device does not support file change notifications",
+        ))
+    }
+
     async fn stat(
         &self,
         _share_id: &str,
@@ -749,6 +804,15 @@ impl RemoteFileWireMessage for RemoteFileRequest {
         self.validate()?;
         let body = match self {
             Self::ListShares => Body::ListShares(proto::RemoteFileListSharesRequest {}),
+            Self::WatchChanges {
+                share_id,
+                epoch,
+                after_sequence,
+            } => Body::WatchChanges(proto::RemoteFileWatchChangesRequest {
+                share_id: share_id.clone(),
+                epoch: epoch.clone(),
+                after_sequence: *after_sequence,
+            }),
             Self::Stat {
                 share_id,
                 relative_path,
@@ -892,6 +956,11 @@ impl RemoteFileWireMessage for RemoteFileRequest {
             .ok_or_else(|| "remote file request body is missing".to_owned())?
         {
             Body::ListShares(_) => Self::ListShares,
+            Body::WatchChanges(request) => Self::WatchChanges {
+                share_id: request.share_id,
+                epoch: request.epoch,
+                after_sequence: request.after_sequence,
+            },
             Body::Stat(r) => Self::Stat {
                 share_id: r.share_id,
                 relative_path: r.relative_path,
@@ -987,6 +1056,10 @@ impl RemoteFileWireMessage for RemoteFileResponse {
                 .error
                 .as_ref()
                 .map(|error| encode_error_code(error.code)),
+            change_epoch: self.change_epoch.clone(),
+            change_sequence: self.change_sequence,
+            changed_directories: self.changed_directories.clone(),
+            change_reset: self.change_reset,
         }
         .encode_to_vec())
     }
@@ -1019,6 +1092,10 @@ impl RemoteFileWireMessage for RemoteFileResponse {
             thumbnail_media_type: frame.thumbnail_media_type,
             revision: frame.revision,
             range_data: frame.range_data,
+            change_epoch: frame.change_epoch,
+            change_sequence: frame.change_sequence,
+            changed_directories: frame.changed_directories,
+            change_reset: frame.change_reset,
         };
         response.validate()?;
         Ok(response)
@@ -1086,6 +1163,7 @@ fn decode_share(share: proto::RemoteFileShareInfo) -> RemoteFileShare {
 
 fn encode_entry(entry: &RemoteFileEntry) -> proto::RemoteFileEntryInfo {
     proto::RemoteFileEntryInfo {
+        id: entry.id.clone(),
         name: entry.name.clone(),
         relative_path: entry.relative_path.clone(),
         kind: match entry.kind {
@@ -1094,6 +1172,7 @@ fn encode_entry(entry: &RemoteFileEntry) -> proto::RemoteFileEntryInfo {
         },
         size: entry.size,
         modified_at_ms: entry.modified_at_ms,
+        revision: entry.revision.clone(),
     }
 }
 
@@ -1104,11 +1183,13 @@ fn decode_entry(entry: proto::RemoteFileEntryInfo) -> RemoteFileCodecResult<Remo
         _ => return Err("invalid remote file entry kind".into()),
     };
     Ok(RemoteFileEntry {
+        id: entry.id,
         name: entry.name,
         relative_path: entry.relative_path,
         kind,
         size: entry.size,
         modified_at_ms: entry.modified_at_ms,
+        revision: entry.revision,
     })
 }
 
@@ -1308,6 +1389,11 @@ mod tests {
                 size: 0,
                 expected_revision: "".into(),
             },
+            RemoteFileRequest::WatchChanges {
+                share_id: "home".into(),
+                epoch: "generation-a".into(),
+                after_sequence: 41,
+            },
         ];
         for request in requests {
             assert_eq!(
@@ -1331,6 +1417,18 @@ mod tests {
         let response = RemoteFileResponse {
             revision: "v1".into(),
             range_data: vec![0, 255, 42],
+            change_epoch: "generation-a".into(),
+            change_sequence: 42,
+            changed_directories: vec!["Projects".into()],
+            entry: Some(RemoteFileEntry {
+                id: "stable-source-id".into(),
+                name: "a".into(),
+                relative_path: "a".into(),
+                kind: RemoteFileKind::File,
+                size: 1,
+                modified_at_ms: 2,
+                revision: "v1".into(),
+            }),
             ..RemoteFileResponse::success()
         };
         assert_eq!(

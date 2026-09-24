@@ -329,8 +329,8 @@ mod tests {
             if expected != "v1" { return Err(crate::remote_files::RemoteFileError::new(RemoteFileErrorCode::Conflict, "stale revision")); }
             let destination = self.upload_destination.as_ref().unwrap();
             tokio::fs::rename(temporary, destination).await.map_err(|e| test_remote_file_error(e.to_string()))?;
-            Ok((crate::remote_files::RemoteFileEntry { name: name.into(), relative_path: name.into(), kind: RemoteFileKind::File,
-                size: std::fs::metadata(destination).unwrap().len(), modified_at_ms: 1 }, "v2".into()))
+            Ok((crate::remote_files::RemoteFileEntry { id: "test-file".into(), name: name.into(), relative_path: name.into(), kind: RemoteFileKind::File,
+                size: std::fs::metadata(destination).unwrap().len(), modified_at_ms: 1, revision: "v2".into() }, "v2".into()))
         }
         async fn list_shares(&self) -> crate::remote_files::RemoteFileResult<Vec<crate::remote_files::RemoteFileShare>> {
             Ok(vec![crate::remote_files::RemoteFileShare {
@@ -379,11 +379,13 @@ mod tests {
             Ok(crate::remote_files::RemoteFileDownload {
                 path,
                 entry: crate::remote_files::RemoteFileEntry {
+                    id: "test-download".into(),
                     name: "download.txt".into(),
                     relative_path: "download.txt".into(),
                     kind: RemoteFileKind::File,
                     size,
                     modified_at_ms: 0,
+                    revision: String::new(),
                 },
             })
         }
@@ -405,6 +407,7 @@ mod tests {
                 overwrite,
                 expected_modified_at_ms: None,
                 entry: crate::remote_files::RemoteFileEntry {
+                    id: "test-upload".into(),
                     name: name.into(),
                     relative_path: if relative_path.is_empty() {
                         name.into()
@@ -414,6 +417,7 @@ mod tests {
                     kind: RemoteFileKind::File,
                     size,
                     modified_at_ms: 0,
+                    revision: String::new(),
                 },
             })
         }
