@@ -14,7 +14,7 @@ ts-rs = { version = "12", features = ["serde-json-impl", "chrono-impl", "uuid-im
 async-trait = "0.1"
 arcrelay-core = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-core.git", rev = "e7e0b968e04b7ee0ca7a4b5cdf879b67d76002b1", optional = true }
 arcrelay-transport = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-transport.git", rev = "c95846ae22ac1a4d72614a126e64ca892f390bca" }
-arcrelay-wire = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-wire.git", rev = "1b0a0504546a45b77f7c0fdb2d2a74b79f9427a7" }
+arcrelay-wire = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-wire.git", rev = "845b2e5fec81e186fbf74a32f14acf505c145326" }
 arcrelay-network = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-network.git", rev = "2d5308be7895ce490e0153d6ed3708578ed125c4" }
 arcrelay-peer = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-peer.git", rev = "48cd4ad8538a0b5add33877f7f9b295e78c4fce1" }
 serde = { version = "1", features = ["derive"] }
