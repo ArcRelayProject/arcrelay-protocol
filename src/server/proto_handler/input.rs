@@ -556,6 +556,29 @@ where
 
     match request {
         RemoteFileRequest::ConditionalUpload { .. } => unreachable!("normalized above"),
+        RemoteFileRequest::WatchChanges {
+            share_id,
+            epoch,
+            after_sequence,
+        } => {
+            let response = if !access.can_read(&share_id) {
+                denied("read access to this share is not permitted")
+            } else {
+                match provider.watch_changes(&share_id, &epoch, after_sequence).await {
+                    Ok((change_epoch, change_sequence, changed_directories, change_reset)) => {
+                        RemoteFileResponse {
+                            change_epoch,
+                            change_sequence,
+                            changed_directories,
+                            change_reset,
+                            ..RemoteFileResponse::success()
+                        }
+                    }
+                    Err(error) => RemoteFileResponse::from_error(error),
+                }
+            };
+            write_remote_message(send, &response).await?;
+        }
         RemoteFileRequest::Stat {
             share_id,
             relative_path,

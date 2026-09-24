@@ -347,10 +347,10 @@ mod feature_negotiation_tests {
     }
 
     #[test]
-    fn remote_files_advertise_the_typed_error_protocol_version() {
+    fn remote_files_advertise_the_change_feed_protocol_version() {
         let feature = feature(proto::Feature::RemoteFiles);
-        assert_eq!(feature.min_version, 2);
-        assert_eq!(feature.max_version, 2);
+        assert_eq!(feature.min_version, 3);
+        assert_eq!(feature.max_version, 3);
     }
 
     #[test]
