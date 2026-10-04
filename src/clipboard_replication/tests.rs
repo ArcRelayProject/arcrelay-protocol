@@ -17,6 +17,7 @@ fn record(index: usize, device: &str) -> ClipboardReplicaRecord {
     ClipboardReplicaRecord {
         first_captured_at_ms: 1_700_000_000_000 + index as i64,
         copy_count: 1,
+        last_used_at_ms: None,
         record: ClipboardSyncRecord {
             sync_id: format!("{index:064x}"),
             kind: ClipboardContentKind::Text,
@@ -59,7 +60,6 @@ async fn database(path: Option<&Path>) -> Arc<ClipboardApplicationService> {
     let service = TestClipboardRepository::open(path).await.unwrap().service();
     let mut policy = service.policy().await.unwrap();
     policy.retention_days = 0;
-    policy.max_items = 10_000;
     service.update_policy(policy).await.unwrap();
     service
 }
@@ -640,8 +640,14 @@ async fn live_selection_survives_restart_and_snapshot_never_selects_the_system_c
 async fn retention_keeps_recent_and_tagged_data_without_prune_redownload_cycles() {
     let a = database(None).await;
     let b = database(None).await;
-    for index in 1..=5 {
-        a.apply_replica_record(record(index, "a")).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for (index, days) in [(1, 40), (2, 35), (3, 31), (4, 15), (5, 1)] {
+        let mut record = record(index, "a");
+        record.record.captured_at_ms = now - days * 86_400_000;
+        a.apply_replica_record(record).await.unwrap();
     }
     let mut tagged = record(1, "a");
     tagged.record.label_memberships = vec![ClipboardLabelMembership {
@@ -653,7 +659,7 @@ async fn retention_keeps_recent_and_tagged_data_without_prune_redownload_cycles(
     a.apply_replica_labels(vec![label("keep")]).await.unwrap();
     a.apply_replica_record(tagged).await.unwrap();
     let mut policy = b.policy().await.unwrap();
-    policy.max_items = 3;
+    policy.retention_days = 30;
     b.update_policy(policy).await.unwrap();
     let connection = link(a.clone(), b.clone()).await;
     let first = reconcile(b.clone(), connection.right.clone())
@@ -695,8 +701,7 @@ async fn retention_keeps_recent_and_tagged_data_without_prune_redownload_cycles(
 async fn matching_retention_policies_converge_despite_device_local_file_history() {
     use arcrelay_core::domain::clipboard::{ClipboardPayload, ClipboardRepository};
     let a = database(None).await;
-    let mut policy = a.policy().await.unwrap();
-    policy.max_items = 3;
+    let policy = a.policy().await.unwrap();
     a.update_policy(policy.clone()).await.unwrap();
     for index in 1..=3 {
         a.apply_replica_record(record(index, "a")).await.unwrap();
@@ -741,4 +746,53 @@ async fn matching_retention_policies_converge_despite_device_local_file_history(
     assert!(second.converged);
     assert_eq!(second.received + second.sent, 0);
     assert_eq!(connection.fetches.load(Ordering::SeqCst), fetches);
+}
+
+#[tokio::test]
+async fn recent_usage_syncs_without_payload_refetch_or_changing_selection() {
+    let a = database(None).await;
+    let b = database(None).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut used = record(1, "a");
+    used.record.captured_at_ms = now - 45 * 86_400_000;
+    used.last_used_at_ms = Some(now - 15 * 86_400_000);
+    a.apply_replica_record(used.clone()).await.unwrap();
+    let mut policy = b.policy().await.unwrap();
+    policy.retention_days = 30;
+    b.update_policy(policy).await.unwrap();
+    let connection = link(a.clone(), b.clone()).await;
+    assert!(
+        reconcile(b.clone(), connection.right.clone())
+            .await
+            .unwrap()
+            .converged
+    );
+    let fetches = connection.fetches.load(Ordering::SeqCst);
+    used.last_used_at_ms = Some(now);
+    a.apply_replica_record(used.clone()).await.unwrap();
+    assert!(
+        reconcile(b.clone(), connection.right.clone())
+            .await
+            .unwrap()
+            .converged
+    );
+    assert_eq!(connection.fetches.load(Ordering::SeqCst), fetches);
+    assert_eq!(
+        b.replica_record(&used.record.sync_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at_ms,
+        Some(now)
+    );
+    assert!(b.replica_selection().await.unwrap().is_none());
+    assert!(
+        reconcile(b, connection.right.clone())
+            .await
+            .unwrap()
+            .converged
+    );
 }

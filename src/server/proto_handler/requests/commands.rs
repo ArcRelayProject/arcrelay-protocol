@@ -115,8 +115,6 @@ async fn handle_command(
                 .clipboard
                 .update_policy(arcrelay_core::domain::clipboard::ClipboardPolicy {
                     history_enabled: policy.history_enabled,
-                    max_items: policy.max_items,
-                    max_bytes: policy.max_bytes,
                     retention_days: policy.retention_days,
                     save_sensitive: policy.save_sensitive,
                 })

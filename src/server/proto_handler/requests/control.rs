@@ -914,11 +914,7 @@ fn validate_command(command: &proto::Command) -> std::result::Result<(), &'stati
             let Some(policy) = command.policy.as_ref() else {
                 return Err("clipboard policy is required");
             };
-            if policy.max_items == 0
-                || policy.max_items > 5000
-                || policy.max_bytes < 1024 * 1024
-                || policy.max_bytes > 1024 * 1024 * 1024
-                || policy.retention_days > 3650
+            if policy.retention_days > 3650
             {
                 return Err("invalid clipboard retention policy");
             }

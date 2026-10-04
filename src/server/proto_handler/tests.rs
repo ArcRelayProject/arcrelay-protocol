@@ -200,13 +200,25 @@ mod tests {
                         history_enabled: true,
                         max_items: 0,
                         max_bytes: 100 * 1024 * 1024,
-                        retention_days: 30,
+                        retention_days: 3651,
                         save_sensitive: false,
                     }),
                 },
             )),
         };
         assert!(validate_command(&invalid_policy).is_err());
+        for (days, items, bytes) in [(0, 0, 0), (30, 500, 104857600), (90, u32::MAX, u64::MAX)] {
+            let command = proto::Command {
+                action: Some(proto::command::Action::UpdateClipboardPolicy(proto::UpdateClipboardPolicyCmd {
+                    policy: Some(proto::ClipboardPolicy {
+                        history_enabled: true, max_items: items, max_bytes: bytes,
+                        retention_days: days, save_sensitive: false,
+                    }),
+                })),
+            };
+            assert!(validate_command(&command).is_ok());
+        }
+
 
         let invalid_cursor = proto::Query {
             body: Some(proto::query::Body::GetClipboard(
