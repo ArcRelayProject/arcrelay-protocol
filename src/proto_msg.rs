@@ -204,8 +204,9 @@ pub fn clipboard_label_to_proto(label: ClipboardLabel) -> proto::ClipboardLabel 
 pub fn clipboard_policy_to_proto(policy: ClipboardPolicy) -> proto::ClipboardPolicy {
     proto::ClipboardPolicy {
         history_enabled: policy.history_enabled,
-        max_items: policy.max_items,
-        max_bytes: policy.max_bytes,
+        // Legacy wire fields remain zero for compatibility; history has no capacity limits.
+        max_items: 0,
+        max_bytes: 0,
         retention_days: policy.retention_days,
         save_sensitive: policy.save_sensitive,
     }
@@ -432,14 +433,12 @@ mod tests {
 
         let policy = clipboard_policy_to_proto(ClipboardPolicy {
             history_enabled: false,
-            max_items: 12,
-            max_bytes: 345,
             retention_days: 6,
             save_sensitive: true,
         });
         assert_eq!(
             (policy.history_enabled, policy.max_items, policy.max_bytes),
-            (false, 12, 345)
+            (false, 0, 0)
         );
         assert!(policy.save_sensitive);
     }

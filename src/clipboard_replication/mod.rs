@@ -386,6 +386,7 @@ pub fn covers(current: &ClipboardReplicaRecord, incoming: &ClipboardReplicaRecor
         && a.captured_at_ms >= b.captured_at_ms
         && current.first_captured_at_ms <= incoming.first_captured_at_ms
         && current.copy_count >= incoming.copy_count
+        && current.last_used_at_ms >= incoming.last_used_at_ms
         && b.label_memberships.iter().all(|incoming| {
             a.label_memberships.iter().any(|current| {
                 current.label_id == incoming.label_id

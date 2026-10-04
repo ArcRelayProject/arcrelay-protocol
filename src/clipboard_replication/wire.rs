@@ -54,6 +54,7 @@ pub(super) fn metadata_to_wire(replica: ClipboardReplicaRecord) -> proto::Clipbo
     proto::ClipboardReplicaRecord {
         first_captured_at_ms: replica.first_captured_at_ms,
         copy_count: replica.copy_count,
+        last_used_at_ms: replica.last_used_at_ms,
         parts: Vec::new(),
         metadata_only: true,
         metadata: Some(proto::ClipboardSyncRecord {
@@ -118,6 +119,9 @@ pub(super) fn metadata_from_wire(
         || wire.first_captured_at_ms <= 0
         || wire.first_captured_at_ms > r.captured_at_ms
         || r.captured_at_ms > chrono_now_ms().saturating_add(300_000)
+        || wire
+            .last_used_at_ms
+            .is_some_and(|used| used <= 0 || used > chrono_now_ms().saturating_add(300_000))
         || wire.copy_count == 0
         || wire.copy_count > i32::MAX as u32
         || !r.labels.is_empty()
@@ -166,6 +170,7 @@ pub(super) fn metadata_from_wire(
     Ok(ClipboardReplicaRecord {
         first_captured_at_ms: wire.first_captured_at_ms,
         copy_count: wire.copy_count,
+        last_used_at_ms: wire.last_used_at_ms,
         record: ClipboardSyncRecord {
             sync_id: r.sync_id,
             kind,
