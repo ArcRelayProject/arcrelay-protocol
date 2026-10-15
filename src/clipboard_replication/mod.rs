@@ -14,18 +14,21 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+pub mod collections;
 mod wire;
 use wire::*;
 #[cfg(test)]
 mod tests;
 
 type Result<T> = std::result::Result<T, String>;
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_MANIFEST_RECORDS: usize = 100_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct ReconciliationResult {
+    /// Metadata-only fingerprints observed during the last reconciliation pass.
+    pub collection_receipts: HashMap<String, String>,
     pub received: usize,
     pub sent: usize,
     pub labels_received: usize,
@@ -133,6 +136,22 @@ async fn serve_request<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     use proto::clipboard_replica_request::Body as Request;
     use proto::clipboard_replica_response::Body as Response;
     match request.body.ok_or("missing clipboard request")? {
+        Request::ScanCollections(scan) => {
+            write(
+                send,
+                &ok(Response::Collections(
+                    collections::page(clipboard, scan.after_id).await?,
+                )),
+            )
+            .await
+        }
+        Request::StoreCollection(record) => {
+            let changed = clipboard
+                .apply_collection(collections::decode(record)?)
+                .await
+                .map_err(|e| e.to_string())?;
+            write(send, &ok(Response::Changed(u32::from(changed)))).await
+        }
         Request::Revision(_) => {
             write(
                 send,
@@ -480,6 +499,7 @@ async fn reconcile_once(
 ) -> Result<()> {
     use proto::clipboard_replica_request::Body as Request;
     use proto::clipboard_replica_response::Body as Response;
+    collections::reconcile(clipboard, client, result).await?;
     // Synchronize the dictionary even when no record currently uses a label.
     let mut remote_labels = HashMap::new();
     let mut label_cursor = String::new();

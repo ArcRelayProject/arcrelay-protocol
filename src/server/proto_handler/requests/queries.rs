@@ -293,6 +293,14 @@ async fn handle_query(
                 )),
             }
         }
+        Some(proto::query::Body::GetClipboardCollections(request)) => {
+            let service = coordinator.service();
+            match crate::clipboard_replication::collections::page(&service.clipboard, request.after_id.clone()).await {
+                Ok(page) => proto::Snapshot { revision: service.clipboard.revision().await.unwrap_or(1),
+                    captured_at_ms: now_ms(), data: Some(proto::snapshot::Data::ClipboardCollections(page)) },
+                Err(message) => return response_error(request_id, proto::ErrorCode::FailedPrecondition, message),
+            }
+        }
         Some(proto::query::Body::GetClipboardSync(request)) => {
             let service = coordinator.service();
             let page = match service

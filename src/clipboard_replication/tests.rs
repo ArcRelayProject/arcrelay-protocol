@@ -796,3 +796,131 @@ async fn recent_usage_syncs_without_payload_refetch_or_changing_selection() {
             .converged
     );
 }
+
+#[tokio::test]
+async fn collections_converge_across_three_peers_without_touching_live_clipboard() {
+    use arcrelay_core::domain::collections::{CollectionDraft, CollectionItem};
+    let a = database(None).await;
+    let b = database(None).await;
+    let c = database(None).await;
+    let saved = a
+        .save_collection(CollectionDraft {
+            id: None,
+            base: None,
+            name: "Account".into(),
+            items: vec![CollectionItem {
+                id: uuid::Uuid::new_v4().to_string(),
+                label: "Password".into(),
+                value: "00123".into(),
+                masked: true,
+                totp: None,
+            }],
+        })
+        .await
+        .unwrap();
+    let ab = link(a.clone(), b.clone()).await;
+    let bc = link(b.clone(), c.clone()).await;
+    assert!(
+        reconcile(a.clone(), ab.left.clone())
+            .await
+            .unwrap()
+            .converged
+    );
+    assert!(
+        reconcile(b.clone(), bc.left.clone())
+            .await
+            .unwrap()
+            .converged
+    );
+    assert!(c.collection(saved.id.clone()).await.unwrap().unwrap() == saved);
+    // A disconnected editor changes the content while another peer favorites it.
+    let mut edited = saved.clone();
+    edited.revision += 1;
+    edited.updated_by_device_id = "offline-c".into();
+    edited.items[0].value = "00987".into();
+    c.apply_collection(edited).await.unwrap();
+    a.change_collection(saved.id.clone(), None, Some(true))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(
+            reconcile(b.clone(), bc.left.clone())
+                .await
+                .unwrap()
+                .converged
+        );
+        assert!(
+            reconcile(a.clone(), ab.left.clone())
+                .await
+                .unwrap()
+                .converged
+        );
+    }
+    let merged = a.collection(saved.id.clone()).await.unwrap().unwrap();
+    assert!(merged.favorite);
+    assert_eq!(merged.items[0].value, "00987");
+    assert!(c.collection(saved.id.clone()).await.unwrap().unwrap() == merged);
+    a.change_collection(saved.id.clone(), Some(merged.version()), None)
+        .await
+        .unwrap();
+    reconcile(a.clone(), ab.left.clone()).await.unwrap();
+    reconcile(b.clone(), bc.left.clone()).await.unwrap();
+    assert!(
+        c.collection(saved.id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    let stable = reconcile(b.clone(), bc.left.clone()).await.unwrap();
+    assert!(stable.converged);
+    assert_eq!(stable.sent + stable.received, 0);
+    assert!(a.replica_page(None, 100).await.unwrap().records.is_empty());
+    assert!(b.replica_page(None, 100).await.unwrap().records.is_empty());
+    assert!(c.replica_page(None, 100).await.unwrap().records.is_empty());
+}
+
+#[tokio::test]
+async fn collection_favorite_does_not_bypass_disabled_content_sync() {
+    use arcrelay_core::domain::collections::CollectionDraft;
+    let a = database(None).await;
+    let b = database(None).await;
+    let saved = a
+        .save_collection(CollectionDraft {
+            id: None,
+            base: None,
+            name: "Original".into(),
+            items: vec![],
+        })
+        .await
+        .unwrap();
+    let connection = link(a.clone(), b.clone()).await;
+    reconcile(a.clone(), connection.left.clone()).await.unwrap();
+    let mut prefs = a.sync_preferences();
+    prefs.sync_edits_and_deletes = false;
+    a.update_sync_preferences(prefs);
+    a.save_collection(CollectionDraft {
+        id: Some(saved.id.clone()),
+        base: Some(saved.version()),
+        name: "Local edit".into(),
+        items: vec![],
+    })
+    .await
+    .unwrap();
+    a.change_collection(saved.id.clone(), None, Some(true))
+        .await
+        .unwrap();
+    let result = reconcile(a.clone(), connection.left.clone()).await.unwrap();
+    assert!(result.converged, "{result:?}");
+    let remote = b.collection(saved.id.clone()).await.unwrap().unwrap();
+    assert_eq!(remote.name, "Original");
+    assert!(remote.favorite);
+    let mut prefs = a.sync_preferences();
+    prefs.sync_edits_and_deletes = true;
+    a.update_sync_preferences(prefs);
+    reconcile(a.clone(), connection.left.clone()).await.unwrap();
+    assert_eq!(
+        b.collection(saved.id).await.unwrap().unwrap().name,
+        "Local edit"
+    );
+}

@@ -121,6 +121,12 @@ async fn handle_command(
                 .await
                 .map_err(CommandFailure::from)
         }
+        Some(proto::command::Action::ApplyClipboardCollection(command)) => {
+            match crate::clipboard_replication::collections::decode(command.clone()) {
+                Ok(record) => service.clipboard.apply_collection(record).await.map(|_| ()).map_err(CommandFailure::from),
+                Err(_) => Err(CommandFailure::invalid("invalid clipboard collection")),
+            }
+        }
         Some(proto::command::Action::ApplyClipboardSyncRecord(command)) => {
             let record = command
                 .record
