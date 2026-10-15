@@ -290,7 +290,7 @@ fn response_error(
 #[cfg(test)]
 mod feature_negotiation_tests {
     #[test]
-    fn clipboard_replication_selects_v2_without_breaking_v1_clients() {
+    fn clipboard_replication_selects_v3_without_breaking_v1_clients() {
         let modern = feature(proto::Feature::ClipboardSync);
         let legacy = proto::FeatureVersion {
             feature: proto::Feature::ClipboardSync as i32,
@@ -298,7 +298,7 @@ mod feature_negotiation_tests {
             max_version: 1,
         };
         for (client, server, expected) in [
-            (modern, modern, 2),
+            (modern, modern, 3),
             (legacy, modern, 1),
             (modern, legacy, 1),
         ] {
@@ -697,7 +697,7 @@ fn authorize_query(
             proto::Feature::Notifications,
             CapabilityId::NotificationRead,
         ),
-        Some(proto::query::Body::GetClipboardSync(_)) => {
+        Some(proto::query::Body::GetClipboardCollections(_)) | Some(proto::query::Body::GetClipboardSync(_)) => {
             (proto::Feature::ClipboardSync, CapabilityId::ClipboardSync)
         }
         None => {
@@ -750,6 +750,9 @@ fn validate_query(query: &proto::Query) -> std::result::Result<(), &'static str>
         }
         Some(proto::query::Body::GetNotifications(request)) if request.limit > 100 => {
             return Err("notification limit must not exceed 100");
+        }
+        Some(proto::query::Body::GetClipboardCollections(request)) => {
+            if request.after_id.len() > 64 { return Err("invalid collection cursor"); }
         }
         Some(proto::query::Body::GetClipboardSync(request)) if request.limit > 200 => {
             return Err("clipboard sync page limit must not exceed 200");
@@ -838,7 +841,7 @@ fn authorize_command(
             proto::Feature::Notifications,
             CapabilityId::NotificationAcknowledge,
         ),
-        Some(proto::command::Action::ApplyClipboardSyncRecord(_)) => {
+        Some(proto::command::Action::ApplyClipboardCollection(_)) | Some(proto::command::Action::ApplyClipboardSyncRecord(_)) => {
             (proto::Feature::ClipboardSync, CapabilityId::ClipboardSync)
         }
         None => {
@@ -949,6 +952,9 @@ fn validate_command(command: &proto::Command) -> std::result::Result<(), &'stati
             if !valid_control_identifier(&command.notification_id) {
                 return Err("invalid notification id");
             }
+        }
+        Some(proto::command::Action::ApplyClipboardCollection(command)) => {
+            crate::clipboard_replication::collections::decode(command.clone()).map_err(|_| "invalid collection")?;
         }
         Some(proto::command::Action::ApplyClipboardSyncRecord(command)) => {
             let Some(record) = command.record.as_ref() else {
@@ -1130,5 +1136,29 @@ fn require_any_capability(
             proto::ErrorCode::PermissionDenied,
             "required capability was not granted",
         ))
+    }
+}
+
+#[cfg(test)]
+mod collection_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn collection_access_requires_clipboard_sync_grant() {
+        let features = HashSet::from([proto::Feature::ClipboardSync as i32]);
+        let ordinary = HashSet::from([CapabilityId::ClipboardRead, CapabilityId::ClipboardWrite]);
+        let sync = HashSet::from([CapabilityId::ClipboardSync]);
+        let query = proto::Query { body: Some(proto::query::Body::GetClipboardCollections(proto::ClipboardCollectionScan::default())) };
+        assert!(authorize_query(1, &query, &features, &ordinary).is_err());
+        assert!(authorize_query(1, &query, &features, &sync).is_ok());
+        let record = arcrelay_core::domain::collections::ClipboardCollection {
+            id: uuid::Uuid::new_v4().to_string(), name: "Test".into(), items: vec![], revision: 1,
+            updated_by_device_id: "test".into(), favorite: false, favorite_revision: 1,
+            favorite_updated_by_device_id: "test".into(), deleted: false,
+        };
+        let command = proto::Command { action: Some(proto::command::Action::ApplyClipboardCollection(crate::clipboard_replication::collections::encode(&record).unwrap())) };
+        assert!(authorize_command(1, &command, &features, &ordinary).is_err());
+        assert!(authorize_command(1, &command, &features, &sync).is_ok());
+        assert!(authorize_command(1, &command, &HashSet::new(), &sync).is_err());
     }
 }
